@@ -13,6 +13,9 @@ use {
     tracing::info,
 };
 
+#[cfg(feature = "web-ui")]
+use axum::http::StatusCode;
+
 use moltis_protocol::TICK_INTERVAL_MS;
 
 use moltis_agents::providers::ProviderRegistry;
@@ -62,9 +65,9 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
 
     #[cfg(feature = "web-ui")]
     let router = router
-        .route("/", get(root_handler))
         .route("/assets/style.css", get(css_handler))
-        .route("/assets/app.js", get(js_handler));
+        .route("/assets/app.js", get(js_handler))
+        .fallback(spa_fallback);
 
     router.layer(cors).with_state(app_state)
 }
@@ -212,9 +215,18 @@ async fn ws_upgrade_handler(
     ws.on_upgrade(move |socket| handle_connection(socket, state.gateway, state.methods, addr))
 }
 
+/// SPA fallback: serve `index.html` for any path not matched by an explicit
+/// route (assets, ws, health). This lets client-side routing handle `/crons`,
+/// `/methods`, etc.
 #[cfg(feature = "web-ui")]
-async fn root_handler() -> impl IntoResponse {
-    Html(include_str!("assets/index.html"))
+async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {
+    // Reject requests that look like missing asset files so the browser gets
+    // a proper 404 instead of HTML.
+    let path = uri.path();
+    if path.starts_with("/assets/") || path.contains('.') {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    Html(include_str!("assets/index.html")).into_response()
 }
 
 #[cfg(feature = "web-ui")]

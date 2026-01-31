@@ -2,38 +2,23 @@
   "use strict";
 
   var $ = function (id) { return document.getElementById(id); };
-  var msgBox = $("messages");
-  var input = $("chatInput");
-  var sendBtn = $("sendBtn");
-  var dot = $("statusDot");
-  var sText = $("statusText");
-  var methodsToggle = $("methodsToggle");
-  var methodsPanel = $("methodsPanel");
-  var rpcMethod = $("rpcMethod");
-  var rpcParams = $("rpcParams");
-  var rpcSend = $("rpcSend");
-  var rpcResult = $("rpcResult");
 
-  var modelSelect = $("modelSelect");
-  var sessionsToggle = $("sessionsToggle");
-  var sessionsPanel = $("sessionsPanel");
-  var sessionList = $("sessionList");
-  var newSessionBtn = $("newSessionBtn");
-
+  // ── Shared state ──────────────────────────────────────────────
   var ws = null;
   var reqId = 0;
   var connected = false;
   var reconnectDelay = 1000;
-  var streamEl = null;
-  var streamText = "";
   var pending = {};
   var models = [];
-  var lastToolOutput = "";
   var activeSessionKey = localStorage.getItem("moltis-session") || "main";
   var sessions = [];
 
-  // ── Theme ────────────────────────────────────────────────────────
+  // Chat-page specific state (persists across page transitions)
+  var streamEl = null;
+  var streamText = "";
+  var lastToolOutput = "";
 
+  // ── Theme ────────────────────────────────────────────────────
   function getSystemTheme() {
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   }
@@ -55,12 +40,10 @@
   function initTheme() {
     var saved = localStorage.getItem("moltis-theme") || "system";
     applyTheme(saved);
-
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () {
       var current = localStorage.getItem("moltis-theme") || "system";
       if (current === "system") applyTheme("system");
     });
-
     $("themeToggle").addEventListener("click", function (e) {
       var btn = e.target.closest(".theme-btn");
       if (!btn) return;
@@ -69,29 +52,34 @@
       applyTheme(mode);
     });
   }
-
   initTheme();
 
-  // ── Helpers ──────────────────────────────────────────────────────
-
+  // ── Helpers ──────────────────────────────────────────────────
   function nextId() { return "ui-" + (++reqId); }
+
+  var dot = $("statusDot");
+  var sText = $("statusText");
+  var modelSelect = $("modelSelect");
+  var sessionsToggle = $("sessionsToggle");
+  var sessionsPanel = $("sessionsPanel");
+  var sessionList = $("sessionList");
+  var newSessionBtn = $("newSessionBtn");
+  var addProviderBtn = $("addProviderBtn");
 
   function setStatus(state, text) {
     dot.className = "status-dot " + state;
     sText.textContent = text;
-    sendBtn.disabled = state !== "connected";
+    var sendBtn = $("sendBtn");
+    if (sendBtn) sendBtn.disabled = state !== "connected";
   }
 
-  // Escape HTML entities to prevent XSS — all user/LLM text is escaped
-  // before being processed by renderMarkdown, which produces safe HTML
-  // from the already-escaped input.
   function esc(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
-  // Simple markdown: input is ALREADY HTML-escaped via esc(), so the
-  // resulting HTML only contains tags we explicitly create.
   function renderMarkdown(raw) {
+    // Input is escaped via esc() before calling this, so the resulting
+    // HTML only contains tags we explicitly create (pre, code, strong).
     var s = esc(raw);
     s = s.replace(/```(\w*)\n([\s\S]*?)```/g, function (_, lang, code) {
       return "<pre><code>" + code + "</code></pre>";
@@ -101,413 +89,13 @@
     return s;
   }
 
-  // Sets element content. When isHtml is true the content MUST have
-  // been produced by renderMarkdown (which escapes first).
-  function addMsg(cls, content, isHtml) {
-    var el = document.createElement("div");
-    el.className = "msg " + cls;
-    if (isHtml) {
-      el.innerHTML = content; // safe: content is escaped via esc() then formatted
-    } else {
-      el.textContent = content;
-    }
-    msgBox.appendChild(el);
-    msgBox.scrollTop = msgBox.scrollHeight;
-    return el;
-  }
-
-  function removeThinking() {
-    var el = document.getElementById("thinkingIndicator");
-    if (el) el.remove();
-  }
-
-  function addErrorMsg(message) {
-    var parsed = parseErrorMessage(message);
-    var el = document.createElement("div");
-    el.className = "msg error-card";
-
-    var icon = document.createElement("div");
-    icon.className = "error-icon";
-    icon.textContent = parsed.icon;
-    el.appendChild(icon);
-
-    var body = document.createElement("div");
-    body.className = "error-body";
-
-    var title = document.createElement("div");
-    title.className = "error-title";
-    title.textContent = parsed.title;
-    body.appendChild(title);
-
-    if (parsed.detail) {
-      var detail = document.createElement("div");
-      detail.className = "error-detail";
-      detail.textContent = parsed.detail;
-      body.appendChild(detail);
-    }
-
-    if (parsed.resetsAt) {
-      var countdown = document.createElement("div");
-      countdown.className = "error-countdown";
-      el.appendChild(body);
-      el.appendChild(countdown);
-      updateCountdown(countdown, parsed.resetsAt);
-      var timer = setInterval(function () {
-        var done = updateCountdown(countdown, parsed.resetsAt);
-        if (done) clearInterval(timer);
-      }, 1000);
-    } else {
-      el.appendChild(body);
-    }
-
-    msgBox.appendChild(el);
-    msgBox.scrollTop = msgBox.scrollHeight;
-  }
-
-  function addErrorCard(err) {
-    var el = document.createElement("div");
-    el.className = "msg error-card";
-
-    var icon = document.createElement("div");
-    icon.className = "error-icon";
-    icon.textContent = err.icon || "\u26A0\uFE0F";
-    el.appendChild(icon);
-
-    var body = document.createElement("div");
-    body.className = "error-body";
-
-    var title = document.createElement("div");
-    title.className = "error-title";
-    title.textContent = err.title;
-    body.appendChild(title);
-
-    if (err.detail) {
-      var detail = document.createElement("div");
-      detail.className = "error-detail";
-      detail.textContent = err.detail;
-      body.appendChild(detail);
-    }
-
-    if (err.provider) {
-      var prov = document.createElement("div");
-      prov.className = "error-detail";
-      prov.textContent = "Provider: " + err.provider;
-      prov.style.marginTop = "4px";
-      prov.style.opacity = "0.6";
-      body.appendChild(prov);
-    }
-
-    if (err.resetsAt) {
-      var countdown = document.createElement("div");
-      countdown.className = "error-countdown";
-      el.appendChild(body);
-      el.appendChild(countdown);
-      updateCountdown(countdown, err.resetsAt);
-      var timer = setInterval(function () {
-        var done = updateCountdown(countdown, err.resetsAt);
-        if (done) clearInterval(timer);
-      }, 1000);
-    } else {
-      el.appendChild(body);
-    }
-
-    msgBox.appendChild(el);
-    msgBox.scrollTop = msgBox.scrollHeight;
-  }
-
-  function parseErrorMessage(message) {
-    // Try to extract JSON from the error message
-    var jsonMatch = message.match(/\{[\s\S]*\}$/);
-    if (jsonMatch) {
-      try {
-        var err = JSON.parse(jsonMatch[0]);
-        var errObj = err.error || err;
-        if (errObj.type === "usage_limit_reached" || (errObj.message && errObj.message.indexOf("usage limit") !== -1)) {
-          return {
-            icon: "",
-            title: "Usage limit reached",
-            detail: "Your " + (errObj.plan_type || "current") + " plan limit has been reached.",
-            resetsAt: errObj.resets_at ? errObj.resets_at * 1000 : null
-          };
-        }
-        if (errObj.type === "rate_limit_exceeded" || (errObj.message && errObj.message.indexOf("rate limit") !== -1)) {
-          return {
-            icon: "\u26A0\uFE0F",
-            title: "Rate limited",
-            detail: errObj.message || "Too many requests. Please wait a moment.",
-            resetsAt: errObj.resets_at ? errObj.resets_at * 1000 : null
-          };
-        }
-        if (errObj.message) {
-          return { icon: "\u26A0\uFE0F", title: "Error", detail: errObj.message, resetsAt: null };
-        }
-      } catch (e) { /* fall through */ }
-    }
-
-    // Check for HTTP status codes in the raw message
-    var statusMatch = message.match(/HTTP (\d{3})/);
-    var code = statusMatch ? parseInt(statusMatch[1], 10) : 0;
-    if (code === 401 || code === 403) {
-      return { icon: "\uD83D\uDD12", title: "Authentication error", detail: "Your session may have expired. Try logging in again.", resetsAt: null };
-    }
-    if (code === 429) {
-      return { icon: "", title: "Rate limited", detail: "Too many requests. Please wait a moment and try again.", resetsAt: null };
-    }
-    if (code >= 500) {
-      return { icon: "\uD83D\uDEA8", title: "Server error", detail: "The upstream provider returned an error. Please try again later.", resetsAt: null };
-    }
-
-    return { icon: "\u26A0\uFE0F", title: "Error", detail: message, resetsAt: null };
-  }
-
-  function updateCountdown(el, resetsAtMs) {
-    var now = Date.now();
-    var diff = resetsAtMs - now;
-    if (diff <= 0) {
-      el.textContent = "Limit should be reset now — try again!";
-      el.className = "error-countdown reset-ready";
-      return true;
-    }
-    var hours = Math.floor(diff / 3600000);
-    var mins = Math.floor((diff % 3600000) / 60000);
-    var parts = [];
-    if (hours > 0) parts.push(hours + "h");
-    parts.push(mins + "m");
-    el.textContent = "Resets in " + parts.join(" ");
-    return false;
-  }
-
-  // ── WebSocket ────────────────────────────────────────────────────
-
-  function connect() {
-    setStatus("connecting", "connecting...");
-    var proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(proto + "//" + location.host + "/ws");
-
-    ws.onopen = function () {
+  function sendRpc(method, params) {
+    return new Promise(function (resolve) {
       var id = nextId();
-      ws.send(JSON.stringify({
-        type: "req", id: id, method: "connect",
-        params: {
-          minProtocol: 3, maxProtocol: 3,
-          client: { id: "web-chat-ui", version: "0.1.0", platform: "browser", mode: "operator" }
-        }
-      }));
-      pending[id] = function (frame) {
-        var hello = frame.ok && frame.payload;
-        if (hello && hello.type === "hello-ok") {
-          connected = true;
-          reconnectDelay = 1000;
-          setStatus("connected", "connected (v" + hello.protocol + ")");
-          var now = new Date();
-          var ts = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-          addMsg("system", "Connected to moltis gateway v" + hello.server.version + " at " + ts);
-          fetchModels();
-          // Restore session — switch to the saved session and load its history.
-          switchSession(activeSessionKey);
-        } else {
-          setStatus("", "handshake failed");
-          var reason = (frame.error && frame.error.message) || "unknown error";
-          addMsg("error", "Handshake failed: " + reason);
-        }
-      };
-    };
-
-    ws.onmessage = function (evt) {
-      var frame;
-      try { frame = JSON.parse(evt.data); } catch (e) { return; }
-
-      if (frame.type === "res") {
-        var cb = pending[frame.id];
-        if (cb) { delete pending[frame.id]; cb(frame); }
-        return;
-      }
-
-      if (frame.type === "event") {
-        if (frame.event === "chat") {
-          var p = frame.payload || {};
-          var eventSession = p.sessionKey || activeSessionKey;
-          var isActive = eventSession === activeSessionKey;
-          if (p.state === "thinking" && isActive) {
-            removeThinking();
-            var thinkEl = document.createElement("div");
-            thinkEl.className = "msg assistant thinking";
-            thinkEl.id = "thinkingIndicator";
-            // Safe: static hardcoded content, no user input
-            var dots = document.createElement("span");
-            dots.className = "thinking-dots";
-            dots.innerHTML = "<span></span><span></span><span></span>";
-            thinkEl.appendChild(dots);
-            msgBox.appendChild(thinkEl);
-            msgBox.scrollTop = msgBox.scrollHeight;
-          } else if (p.state === "thinking_done" && isActive) {
-            removeThinking();
-          } else if (p.state === "tool_call_start" && isActive) {
-            removeThinking();
-            var card = document.createElement("div");
-            card.className = "msg exec-card running";
-            card.id = "tool-" + p.toolCallId;
-            var prompt = document.createElement("div");
-            prompt.className = "exec-prompt";
-            // For exec tool, show the shell command; otherwise show tool name
-            var cmd = (p.toolName === "exec" && p.arguments && p.arguments.command)
-              ? p.arguments.command
-              : (p.toolName || "tool");
-            var promptChar = document.createElement("span");
-            promptChar.className = "exec-prompt-char";
-            promptChar.textContent = "$";
-            prompt.appendChild(promptChar);
-            var cmdSpan = document.createElement("span");
-            cmdSpan.textContent = " " + cmd;
-            prompt.appendChild(cmdSpan);
-            card.appendChild(prompt);
-            // Spinner placeholder
-            var spin = document.createElement("div");
-            spin.className = "exec-status";
-            spin.textContent = "running\u2026";
-            card.appendChild(spin);
-            msgBox.appendChild(card);
-            msgBox.scrollTop = msgBox.scrollHeight;
-          } else if (p.state === "tool_call_end" && isActive) {
-            var card = document.getElementById("tool-" + p.toolCallId);
-            if (card) {
-              card.className = "msg exec-card " + (p.success ? "exec-ok" : "exec-err");
-              // Remove the spinner
-              var spin = card.querySelector(".exec-status");
-              if (spin) spin.remove();
-              if (p.success && p.result) {
-                // Show stdout output; also record it to suppress LLM echo
-                var out = (p.result.stdout || "").replace(/\n+$/, "");
-                lastToolOutput = out;
-                if (out) {
-                  var outEl = document.createElement("pre");
-                  outEl.className = "exec-output";
-                  outEl.textContent = out;
-                  card.appendChild(outEl);
-                }
-                var err = (p.result.stderr || "").replace(/\n+$/, "");
-                if (err) {
-                  var errEl = document.createElement("pre");
-                  errEl.className = "exec-output exec-stderr";
-                  errEl.textContent = err;
-                  card.appendChild(errEl);
-                }
-                if (p.result.exit_code !== undefined && p.result.exit_code !== 0) {
-                  var code = document.createElement("div");
-                  code.className = "exec-exit";
-                  code.textContent = "exit " + p.result.exit_code;
-                  card.appendChild(code);
-                }
-              } else if (!p.success && p.error && p.error.detail) {
-                var errMsg = document.createElement("div");
-                errMsg.className = "exec-error-detail";
-                errMsg.textContent = p.error.detail;
-                card.appendChild(errMsg);
-              }
-            }
-          } else if (p.state === "delta" && p.text && isActive) {
-            removeThinking();
-            if (!streamEl) {
-              streamText = "";
-              streamEl = document.createElement("div");
-              streamEl.className = "msg assistant";
-              msgBox.appendChild(streamEl);
-            }
-            streamText += p.text;
-            // Safe: renderMarkdown calls esc() first to escape all HTML entities,
-            // then only adds our own formatting tags (pre, code, strong)
-            streamEl.innerHTML = renderMarkdown(streamText);
-            msgBox.scrollTop = msgBox.scrollHeight;
-          } else if (p.state === "final") {
-            // Always update sidebar indicators for the event's session.
-            bumpSessionCount(eventSession, 1);
-            setSessionReplying(eventSession, false);
-            if (!isActive) {
-              setSessionUnread(eventSession, true);
-            }
-            if (isActive) {
-              removeThinking();
-              // Suppress the LLM response when it just echoes tool output
-              // already shown in the exec card.
-              var isEcho = lastToolOutput && p.text
-                && p.text.replace(/[`\s]/g, "").indexOf(lastToolOutput.replace(/\s/g, "").substring(0, 80)) !== -1;
-              var msgEl = null;
-              if (!isEcho) {
-                if (p.text && streamEl) {
-                  // Safe: renderMarkdown calls esc() first to escape all HTML entities
-                  streamEl.innerHTML = renderMarkdown(p.text);
-                  msgEl = streamEl;
-                } else if (p.text && !streamEl) {
-                  msgEl = addMsg("assistant", renderMarkdown(p.text), true);
-                }
-              } else if (streamEl) {
-                streamEl.remove();
-              }
-              if (msgEl && p.model) {
-                var footer = document.createElement("div");
-                footer.className = "msg-model-footer";
-                footer.textContent = p.provider ? p.provider + " / " + p.model : p.model;
-                msgEl.appendChild(footer);
-              }
-              streamEl = null;
-              streamText = "";
-              lastToolOutput = "";
-            }
-          } else if (p.state === "error") {
-            // Always update sidebar indicators for the event's session.
-            setSessionReplying(eventSession, false);
-            if (isActive) {
-              removeThinking();
-              if (p.error && p.error.title) {
-                addErrorCard(p.error);
-              } else {
-                // Backward compat: old payloads with just p.message
-                addErrorMsg(p.message || "unknown");
-              }
-              streamEl = null;
-              streamText = "";
-            }
-          }
-        }
-        if (frame.event === "exec.approval.requested") {
-          var ap = frame.payload || {};
-          renderApprovalCard(ap.requestId, ap.command);
-        }
-        return;
-      }
-    };
-
-    ws.onclose = function () {
-      connected = false;
-      setStatus("", "disconnected — reconnecting…");
-      streamEl = null;
-      streamText = "";
-      scheduleReconnect();
-    };
-
-    ws.onerror = function () {};
+      pending[id] = resolve;
+      ws.send(JSON.stringify({ type: "req", id: id, method: method, params: params }));
+    });
   }
-
-  var reconnectTimer = null;
-
-  function scheduleReconnect() {
-    if (reconnectTimer) return;
-    reconnectTimer = setTimeout(function () {
-      reconnectTimer = null;
-      reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
-      connect();
-    }, reconnectDelay);
-  }
-
-  // Reconnect immediately when the tab becomes visible again.
-  document.addEventListener("visibilitychange", function () {
-    if (!document.hidden && !connected) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-      reconnectDelay = 1000;
-      connect();
-    }
-  });
 
   function fetchModels() {
     sendRpc("models.list", {}).then(function (res) {
@@ -538,143 +126,287 @@
     localStorage.setItem("moltis-model", modelSelect.value);
   });
 
-  function sendRpc(method, params) {
-    return new Promise(function (resolve) {
-      var id = nextId();
-      pending[id] = resolve;
-      ws.send(JSON.stringify({ type: "req", id: id, method: method, params: params }));
-    });
+  // ── Router ──────────────────────────────────────────────────
+  var pages = {};
+  var currentPage = null;
+  var pageContent = $("pageContent");
+
+  function registerPage(path, init, teardown) {
+    pages[path] = { init: init, teardown: teardown || function () {} };
   }
 
-  function sendChat() {
-    var text = input.value.trim();
-    if (!text || !connected) return;
-    input.value = "";
-    autoResize();
-    addMsg("user", renderMarkdown(text), true);
-    var chatParams = { text: text };
-    var selectedModel = modelSelect.value;
-    if (selectedModel) chatParams.model = selectedModel;
-    var sendSessionKey = activeSessionKey;
-    bumpSessionCount(sendSessionKey, 1);
-    setSessionReplying(sendSessionKey, true);
-    sendRpc("chat.send", chatParams).then(function (res) {
-      if (res && !res.ok && res.error) {
-        addMsg("error", res.error.message || "Request failed");
-      }
-    });
+  function navigate(path) {
+    if (path === currentPage) return;
+    history.pushState(null, "", path);
+    mount(path);
   }
 
-  function autoResize() {
-    input.style.height = "auto";
-    input.style.height = Math.min(input.scrollHeight, 120) + "px";
-  }
-
-  // ── Event listeners ──────────────────────────────────────────────
-
-  input.addEventListener("input", autoResize);
-  input.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
-  });
-  sendBtn.addEventListener("click", sendChat);
-
-  methodsToggle.addEventListener("click", function () {
-    methodsPanel.classList.toggle("hidden");
-  });
-
-  rpcSend.addEventListener("click", function () {
-    var method = rpcMethod.value.trim();
-    if (!method || !connected) return;
-    var params;
-    var raw = rpcParams.value.trim();
-    if (raw) {
-      try { params = JSON.parse(raw); } catch (e) {
-        rpcResult.textContent = "Invalid JSON: " + e.message;
-        return;
-      }
+  function mount(path) {
+    if (currentPage && pages[currentPage]) {
+      pages[currentPage].teardown();
     }
-    rpcResult.textContent = "calling...";
-    sendRpc(method, params).then(function (res) {
-      rpcResult.textContent = JSON.stringify(res, null, 2);
+    pageContent.textContent = "";
+
+    var page = pages[path] || pages["/"];
+    currentPage = pages[path] ? path : "/";
+
+    var links = document.querySelectorAll(".nav-link");
+    links.forEach(function (a) {
+      a.classList.toggle("active", a.getAttribute("href") === currentPage);
     });
+
+    if (page) page.init(pageContent);
+  }
+
+  window.addEventListener("popstate", function () {
+    mount(location.pathname);
   });
 
-  // ── Approval cards ─────────────────────────────────────────────
+  // ── Nav panel (burger toggle) ────────────────────────────────
+  var burgerBtn = $("burgerBtn");
+  var navPanel = $("navPanel");
 
-  function renderApprovalCard(requestId, command) {
-    var card = document.createElement("div");
-    card.className = "msg approval-card";
-    card.id = "approval-" + requestId;
+  burgerBtn.addEventListener("click", function () {
+    navPanel.classList.toggle("hidden");
+  });
 
-    var label = document.createElement("div");
-    label.className = "approval-label";
-    label.textContent = "Command requires approval:";
-    card.appendChild(label);
+  navPanel.addEventListener("click", function (e) {
+    var link = e.target.closest("[data-nav]");
+    if (!link) return;
+    e.preventDefault();
+    navigate(link.getAttribute("href"));
+  });
 
-    var cmdEl = document.createElement("code");
-    cmdEl.className = "approval-cmd";
-    cmdEl.textContent = command;
-    card.appendChild(cmdEl);
+  // ── Sessions sidebar ────────────────────────────────────────
+  sessionsToggle.addEventListener("click", function () {
+    sessionsPanel.classList.toggle("hidden");
+  });
 
-    var btnGroup = document.createElement("div");
-    btnGroup.className = "approval-btns";
-
-    var allowBtn = document.createElement("button");
-    allowBtn.className = "approval-btn approval-allow";
-    allowBtn.textContent = "Allow";
-    allowBtn.onclick = function () { resolveApproval(requestId, "approved", command, card); };
-
-    var denyBtn = document.createElement("button");
-    denyBtn.className = "approval-btn approval-deny";
-    denyBtn.textContent = "Deny";
-    denyBtn.onclick = function () { resolveApproval(requestId, "denied", null, card); };
-
-    btnGroup.appendChild(allowBtn);
-    btnGroup.appendChild(denyBtn);
-    card.appendChild(btnGroup);
-
-    // Countdown.
-    var countdown = document.createElement("div");
-    countdown.className = "approval-countdown";
-    card.appendChild(countdown);
-    var remaining = 120;
-    var timer = setInterval(function () {
-      remaining--;
-      countdown.textContent = remaining + "s";
-      if (remaining <= 0) {
-        clearInterval(timer);
-        card.classList.add("approval-expired");
-        allowBtn.disabled = true;
-        denyBtn.disabled = true;
-        countdown.textContent = "expired";
-      }
-    }, 1000);
-    countdown.textContent = remaining + "s";
-
-    msgBox.appendChild(card);
-    msgBox.scrollTop = msgBox.scrollHeight;
-  }
-
-  function resolveApproval(requestId, decision, command, card) {
-    var params = { requestId: requestId, decision: decision };
-    if (command) params.command = command;
-    sendRpc("exec.approval.resolve", params).then(function () {
-      card.classList.add("approval-resolved");
-      var btns = card.querySelectorAll(".approval-btn");
-      btns.forEach(function (b) { b.disabled = true; });
-      var status = document.createElement("div");
-      status.className = "approval-status";
-      status.textContent = decision === "approved" ? "Allowed" : "Denied";
-      card.appendChild(status);
+  function fetchSessions() {
+    sendRpc("sessions.list", {}).then(function (res) {
+      if (!res || !res.ok) return;
+      sessions = res.payload || [];
+      renderSessionList();
     });
   }
 
-  // ── Provider modal ─────────────────────────────────────────────
+  function renderSessionList() {
+    sessionList.textContent = "";
+    sessions.forEach(function (s) {
+      var item = document.createElement("div");
+      item.className = "session-item" + (s.key === activeSessionKey ? " active" : "");
+      item.setAttribute("data-session-key", s.key);
 
+      var info = document.createElement("div");
+      info.className = "session-info";
+
+      var label = document.createElement("div");
+      label.className = "session-label";
+      label.textContent = s.label || s.key;
+      info.appendChild(label);
+
+      var meta = document.createElement("div");
+      meta.className = "session-meta";
+      meta.setAttribute("data-session-key", s.key);
+      var count = s.messageCount || 0;
+      meta.textContent = count + " msg" + (count !== 1 ? "s" : "");
+      info.appendChild(meta);
+
+      item.appendChild(info);
+
+      var actions = document.createElement("div");
+      actions.className = "session-actions";
+
+      if (s.key !== "main") {
+        var renameBtn = document.createElement("button");
+        renameBtn.className = "session-action-btn";
+        renameBtn.textContent = "\u270F";
+        renameBtn.title = "Rename";
+        renameBtn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          var newLabel = prompt("Rename session:", s.label || s.key);
+          if (newLabel !== null) {
+            sendRpc("sessions.patch", { key: s.key, label: newLabel }).then(fetchSessions);
+          }
+        });
+        actions.appendChild(renameBtn);
+
+        var deleteBtn = document.createElement("button");
+        deleteBtn.className = "session-action-btn session-delete";
+        deleteBtn.textContent = "\u2715";
+        deleteBtn.title = "Delete";
+        deleteBtn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          if (confirm("Delete this session?")) {
+            sendRpc("sessions.delete", { key: s.key }).then(function () {
+              if (activeSessionKey === s.key) switchSession("main");
+              fetchSessions();
+            });
+          }
+        });
+        actions.appendChild(deleteBtn);
+      }
+      item.appendChild(actions);
+
+      item.addEventListener("click", function () {
+        if (currentPage !== "/") navigate("/");
+        switchSession(s.key);
+      });
+
+      sessionList.appendChild(item);
+    });
+  }
+
+  function setSessionReplying(key, replying) {
+    var el = sessionList.querySelector('.session-item[data-session-key="' + key + '"]');
+    if (el) el.classList.toggle("replying", replying);
+  }
+
+  function setSessionUnread(key, unread) {
+    var el = sessionList.querySelector('.session-item[data-session-key="' + key + '"]');
+    if (el) el.classList.toggle("unread", unread);
+  }
+
+  function bumpSessionCount(key, increment) {
+    var el = sessionList.querySelector('.session-meta[data-session-key="' + key + '"]');
+    if (!el) return;
+    var current = parseInt(el.textContent, 10) || 0;
+    var next = current + increment;
+    el.textContent = next + " msg" + (next !== 1 ? "s" : "");
+  }
+
+  newSessionBtn.addEventListener("click", function () {
+    if (currentPage !== "/") navigate("/");
+    var key = "session:" + crypto.randomUUID();
+    switchSession(key);
+  });
+
+  // ── Session search ──────────────────────────────────────────
+  var searchInput = $("sessionSearch");
+  var searchResults = $("searchResults");
+  var searchTimer = null;
+  var searchHits = [];
+  var searchIdx = -1;
+
+  function debounceSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(doSearch, 300);
+  }
+
+  function doSearch() {
+    var q = searchInput.value.trim();
+    if (!q || !connected) { hideSearch(); return; }
+    sendRpc("sessions.search", { query: q }).then(function (res) {
+      if (!res || !res.ok) { hideSearch(); return; }
+      searchHits = res.payload || [];
+      searchIdx = -1;
+      renderSearchResults(q);
+    });
+  }
+
+  function hideSearch() {
+    searchResults.classList.add("hidden");
+    searchHits = [];
+    searchIdx = -1;
+  }
+
+  function renderSearchResults(query) {
+    searchResults.textContent = "";
+    if (searchHits.length === 0) {
+      var empty = document.createElement("div");
+      empty.style.padding = "8px 10px";
+      empty.style.fontSize = ".78rem";
+      empty.style.color = "var(--muted)";
+      empty.textContent = "No results";
+      searchResults.appendChild(empty);
+      searchResults.classList.remove("hidden");
+      return;
+    }
+    searchHits.forEach(function (hit, i) {
+      var el = document.createElement("div");
+      el.className = "search-hit";
+      el.setAttribute("data-idx", i);
+
+      var lbl = document.createElement("div");
+      lbl.className = "search-hit-label";
+      lbl.textContent = hit.label || hit.sessionKey;
+      el.appendChild(lbl);
+
+      // Safe: esc() escapes all HTML entities first, then we only wrap
+      // the already-escaped query substring in <mark> tags.
+      var snip = document.createElement("div");
+      snip.className = "search-hit-snippet";
+      var escaped = esc(hit.snippet);
+      var qEsc = esc(query);
+      var re = new RegExp("(" + qEsc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
+      snip.innerHTML = escaped.replace(re, "<mark>$1</mark>");
+      el.appendChild(snip);
+
+      var role = document.createElement("div");
+      role.className = "search-hit-role";
+      role.textContent = hit.role;
+      el.appendChild(role);
+
+      el.addEventListener("click", function () {
+        if (currentPage !== "/") navigate("/");
+        var ctx = { query: query, messageIndex: hit.messageIndex };
+        switchSession(hit.sessionKey, ctx);
+        searchInput.value = "";
+        hideSearch();
+      });
+
+      searchResults.appendChild(el);
+    });
+    searchResults.classList.remove("hidden");
+  }
+
+  function updateSearchActive() {
+    var items = searchResults.querySelectorAll(".search-hit");
+    items.forEach(function (el, i) {
+      el.classList.toggle("kb-active", i === searchIdx);
+    });
+    if (searchIdx >= 0 && items[searchIdx]) {
+      items[searchIdx].scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  searchInput.addEventListener("input", debounceSearch);
+  searchInput.addEventListener("keydown", function (e) {
+    if (searchResults.classList.contains("hidden")) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      searchIdx = Math.min(searchIdx + 1, searchHits.length - 1);
+      updateSearchActive();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      searchIdx = Math.max(searchIdx - 1, 0);
+      updateSearchActive();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (searchIdx >= 0 && searchHits[searchIdx]) {
+        var h = searchHits[searchIdx];
+        if (currentPage !== "/") navigate("/");
+        var ctx = { query: searchInput.value.trim(), messageIndex: h.messageIndex };
+        switchSession(h.sessionKey, ctx);
+        searchInput.value = "";
+        hideSearch();
+      }
+    } else if (e.key === "Escape") {
+      searchInput.value = "";
+      hideSearch();
+    }
+  });
+
+  document.addEventListener("click", function (e) {
+    if (!searchInput.contains(e.target) && !searchResults.contains(e.target)) {
+      hideSearch();
+    }
+  });
+
+  // ── Provider modal ──────────────────────────────────────────
   var providerModal = $("providerModal");
   var providerModalBody = $("providerModalBody");
   var providerModalTitle = $("providerModalTitle");
-  var addProviderBtn = $("addProviderBtn");
   var providerModalClose = $("providerModalClose");
 
   function openProviderModal() {
@@ -715,11 +447,8 @@
         item.appendChild(badges);
 
         item.addEventListener("click", function () {
-          if (p.authType === "api-key") {
-            showApiKeyForm(p);
-          } else if (p.authType === "oauth") {
-            showOAuthFlow(p);
-          }
+          if (p.authType === "api-key") showApiKeyForm(p);
+          else if (p.authType === "oauth") showOAuthFlow(p);
         });
         providerModalBody.appendChild(item);
       });
@@ -742,11 +471,11 @@
     label.textContent = "API Key";
     form.appendChild(label);
 
-    var input = document.createElement("input");
-    input.className = "provider-key-input";
-    input.type = "password";
-    input.placeholder = "sk-...";
-    form.appendChild(input);
+    var inp = document.createElement("input");
+    inp.className = "provider-key-input";
+    inp.type = "password";
+    inp.placeholder = "sk-...";
+    form.appendChild(inp);
 
     var btns = document.createElement("div");
     btns.style.display = "flex";
@@ -762,7 +491,7 @@
     saveBtn.className = "provider-btn";
     saveBtn.textContent = "Save";
     saveBtn.addEventListener("click", function () {
-      var key = input.value.trim();
+      var key = inp.value.trim();
       if (!key) return;
       saveBtn.disabled = true;
       saveBtn.textContent = "Saving...";
@@ -779,7 +508,7 @@
           saveBtn.disabled = false;
           saveBtn.textContent = "Save";
           var err = (res && res.error && res.error.message) || "Failed to save";
-          input.style.borderColor = "var(--error)";
+          inp.style.borderColor = "var(--error)";
           label.textContent = err;
           label.style.color = "var(--error)";
         }
@@ -787,9 +516,8 @@
     });
     btns.appendChild(saveBtn);
     form.appendChild(btns);
-
     providerModalBody.appendChild(form);
-    input.focus();
+    inp.focus();
   }
 
   function showOAuthFlow(provider) {
@@ -826,7 +554,6 @@
           connectBtn.textContent = "Waiting for auth...";
           pollOAuthStatus(provider);
         } else if (res && res.ok && res.payload && res.payload.deviceFlow) {
-          // Device-flow OAuth: show user code and verification URL
           connectBtn.textContent = "Waiting for auth...";
           desc.style.color = "";
           desc.textContent = "";
@@ -852,13 +579,12 @@
     });
     btns.appendChild(connectBtn);
     wrapper.appendChild(btns);
-
     providerModalBody.appendChild(wrapper);
   }
 
   function pollOAuthStatus(provider) {
     var attempts = 0;
-    var maxAttempts = 60; // 60 * 2s = 120s
+    var maxAttempts = 60;
     var timer = setInterval(function () {
       attempts++;
       if (attempts > maxAttempts) {
@@ -888,121 +614,211 @@
   addProviderBtn.addEventListener("click", function () {
     if (connected) openProviderModal();
   });
-
   providerModalClose.addEventListener("click", closeProviderModal);
-
   providerModal.addEventListener("click", function (e) {
     if (e.target === providerModal) closeProviderModal();
   });
 
-  // ── Sessions ──────────────────────────────────────────────────
-
-  sessionsToggle.addEventListener("click", function () {
-    sessionsPanel.classList.toggle("hidden");
-  });
-
-  function fetchSessions() {
-    sendRpc("sessions.list", {}).then(function (res) {
-      if (!res || !res.ok) return;
-      sessions = res.payload || [];
-      renderSessionList();
-    });
+  // ── Error helpers ───────────────────────────────────────────
+  function parseErrorMessage(message) {
+    var jsonMatch = message.match(/\{[\s\S]*\}$/);
+    if (jsonMatch) {
+      try {
+        var err = JSON.parse(jsonMatch[0]);
+        var errObj = err.error || err;
+        if (errObj.type === "usage_limit_reached" || (errObj.message && errObj.message.indexOf("usage limit") !== -1)) {
+          return { icon: "", title: "Usage limit reached", detail: "Your " + (errObj.plan_type || "current") + " plan limit has been reached.", resetsAt: errObj.resets_at ? errObj.resets_at * 1000 : null };
+        }
+        if (errObj.type === "rate_limit_exceeded" || (errObj.message && errObj.message.indexOf("rate limit") !== -1)) {
+          return { icon: "\u26A0\uFE0F", title: "Rate limited", detail: errObj.message || "Too many requests. Please wait a moment.", resetsAt: errObj.resets_at ? errObj.resets_at * 1000 : null };
+        }
+        if (errObj.message) {
+          return { icon: "\u26A0\uFE0F", title: "Error", detail: errObj.message, resetsAt: null };
+        }
+      } catch (e) { /* fall through */ }
+    }
+    var statusMatch = message.match(/HTTP (\d{3})/);
+    var code = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+    if (code === 401 || code === 403) return { icon: "\uD83D\uDD12", title: "Authentication error", detail: "Your session may have expired.", resetsAt: null };
+    if (code === 429) return { icon: "", title: "Rate limited", detail: "Too many requests.", resetsAt: null };
+    if (code >= 500) return { icon: "\uD83D\uDEA8", title: "Server error", detail: "The upstream provider returned an error.", resetsAt: null };
+    return { icon: "\u26A0\uFE0F", title: "Error", detail: message, resetsAt: null };
   }
 
-  function renderSessionList() {
-    sessionList.textContent = "";
-    sessions.forEach(function (s) {
-      var item = document.createElement("div");
-      item.className = "session-item" + (s.key === activeSessionKey ? " active" : "");
-      item.setAttribute("data-session-key", s.key);
+  function updateCountdown(el, resetsAtMs) {
+    var now = Date.now();
+    var diff = resetsAtMs - now;
+    if (diff <= 0) {
+      el.textContent = "Limit should be reset now \u2014 try again!";
+      el.className = "error-countdown reset-ready";
+      return true;
+    }
+    var hours = Math.floor(diff / 3600000);
+    var mins = Math.floor((diff % 3600000) / 60000);
+    var parts = [];
+    if (hours > 0) parts.push(hours + "h");
+    parts.push(mins + "m");
+    el.textContent = "Resets in " + parts.join(" ");
+    return false;
+  }
 
-      var info = document.createElement("div");
-      info.className = "session-info";
+  // ════════════════════════════════════════════════════════════
+  // Chat page
+  // ════════════════════════════════════════════════════════════
+  var chatMsgBox = null;
+  var chatInput = null;
+  var chatSendBtn = null;
 
-      var label = document.createElement("div");
-      label.className = "session-label";
-      label.textContent = s.label || s.key;
-      info.appendChild(label);
+  function chatAddMsg(cls, content, isHtml) {
+    if (!chatMsgBox) return null;
+    var el = document.createElement("div");
+    el.className = "msg " + cls;
+    if (isHtml) {
+      // Safe: content is produced by renderMarkdown which escapes via esc() first,
+      // then only adds our own formatting tags (pre, code, strong).
+      el.innerHTML = content;
+    } else {
+      el.textContent = content;
+    }
+    chatMsgBox.appendChild(el);
+    chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+    return el;
+  }
 
-      var meta = document.createElement("div");
-      meta.className = "session-meta";
-      meta.setAttribute("data-session-key", s.key);
-      var count = s.messageCount || 0;
-      meta.textContent = count + " msg" + (count !== 1 ? "s" : "");
-      info.appendChild(meta);
+  function removeThinking() {
+    var el = document.getElementById("thinkingIndicator");
+    if (el) el.remove();
+  }
 
-      item.appendChild(info);
+  function chatAddErrorCard(err) {
+    if (!chatMsgBox) return;
+    var el = document.createElement("div");
+    el.className = "msg error-card";
 
-      // Actions (rename + delete) for non-main sessions
-      var actions = document.createElement("div");
-      actions.className = "session-actions";
+    var icon = document.createElement("div");
+    icon.className = "error-icon";
+    icon.textContent = err.icon || "\u26A0\uFE0F";
+    el.appendChild(icon);
 
-      if (s.key !== "main") {
-        var renameBtn = document.createElement("button");
-        renameBtn.className = "session-action-btn";
-        renameBtn.textContent = "\u270F";
-        renameBtn.title = "Rename";
-        renameBtn.addEventListener("click", function (e) {
-          e.stopPropagation();
-          var newLabel = prompt("Rename session:", s.label || s.key);
-          if (newLabel !== null) {
-            sendRpc("sessions.patch", { key: s.key, label: newLabel }).then(fetchSessions);
-          }
-        });
-        actions.appendChild(renameBtn);
+    var body = document.createElement("div");
+    body.className = "error-body";
 
-        var deleteBtn = document.createElement("button");
-        deleteBtn.className = "session-action-btn session-delete";
-        deleteBtn.textContent = "\u2715";
-        deleteBtn.title = "Delete";
-        deleteBtn.addEventListener("click", function (e) {
-          e.stopPropagation();
-          if (confirm("Delete this session?")) {
-            sendRpc("sessions.delete", { key: s.key }).then(function () {
-              if (activeSessionKey === s.key) {
-                switchSession("main");
-              }
-              fetchSessions();
-            });
-          }
-        });
-        actions.appendChild(deleteBtn);
+    var title = document.createElement("div");
+    title.className = "error-title";
+    title.textContent = err.title;
+    body.appendChild(title);
+
+    if (err.detail) {
+      var detail = document.createElement("div");
+      detail.className = "error-detail";
+      detail.textContent = err.detail;
+      body.appendChild(detail);
+    }
+
+    if (err.provider) {
+      var prov = document.createElement("div");
+      prov.className = "error-detail";
+      prov.textContent = "Provider: " + err.provider;
+      prov.style.marginTop = "4px";
+      prov.style.opacity = "0.6";
+      body.appendChild(prov);
+    }
+
+    if (err.resetsAt) {
+      var countdown = document.createElement("div");
+      countdown.className = "error-countdown";
+      el.appendChild(body);
+      el.appendChild(countdown);
+      updateCountdown(countdown, err.resetsAt);
+      var timer = setInterval(function () {
+        if (updateCountdown(countdown, err.resetsAt)) clearInterval(timer);
+      }, 1000);
+    } else {
+      el.appendChild(body);
+    }
+
+    chatMsgBox.appendChild(el);
+    chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+  }
+
+  function chatAddErrorMsg(message) {
+    chatAddErrorCard(parseErrorMessage(message));
+  }
+
+  function renderApprovalCard(requestId, command) {
+    if (!chatMsgBox) return;
+    var card = document.createElement("div");
+    card.className = "msg approval-card";
+    card.id = "approval-" + requestId;
+
+    var label = document.createElement("div");
+    label.className = "approval-label";
+    label.textContent = "Command requires approval:";
+    card.appendChild(label);
+
+    var cmdEl = document.createElement("code");
+    cmdEl.className = "approval-cmd";
+    cmdEl.textContent = command;
+    card.appendChild(cmdEl);
+
+    var btnGroup = document.createElement("div");
+    btnGroup.className = "approval-btns";
+
+    var allowBtn = document.createElement("button");
+    allowBtn.className = "approval-btn approval-allow";
+    allowBtn.textContent = "Allow";
+    allowBtn.onclick = function () { resolveApproval(requestId, "approved", command, card); };
+
+    var denyBtn = document.createElement("button");
+    denyBtn.className = "approval-btn approval-deny";
+    denyBtn.textContent = "Deny";
+    denyBtn.onclick = function () { resolveApproval(requestId, "denied", null, card); };
+
+    btnGroup.appendChild(allowBtn);
+    btnGroup.appendChild(denyBtn);
+    card.appendChild(btnGroup);
+
+    var countdown = document.createElement("div");
+    countdown.className = "approval-countdown";
+    card.appendChild(countdown);
+    var remaining = 120;
+    var timer = setInterval(function () {
+      remaining--;
+      countdown.textContent = remaining + "s";
+      if (remaining <= 0) {
+        clearInterval(timer);
+        card.classList.add("approval-expired");
+        allowBtn.disabled = true;
+        denyBtn.disabled = true;
+        countdown.textContent = "expired";
       }
-      item.appendChild(actions);
+    }, 1000);
+    countdown.textContent = remaining + "s";
 
-      item.addEventListener("click", function () {
-        switchSession(s.key);
-      });
+    chatMsgBox.appendChild(card);
+    chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+  }
 
-      sessionList.appendChild(item);
+  function resolveApproval(requestId, decision, command, card) {
+    var params = { requestId: requestId, decision: decision };
+    if (command) params.command = command;
+    sendRpc("exec.approval.resolve", params).then(function () {
+      card.classList.add("approval-resolved");
+      card.querySelectorAll(".approval-btn").forEach(function (b) { b.disabled = true; });
+      var status = document.createElement("div");
+      status.className = "approval-status";
+      status.textContent = decision === "approved" ? "Allowed" : "Denied";
+      card.appendChild(status);
     });
-  }
-
-  function setSessionReplying(key, replying) {
-    var el = sessionList.querySelector('.session-item[data-session-key="' + key + '"]');
-    if (el) el.classList.toggle("replying", replying);
-  }
-
-  function setSessionUnread(key, unread) {
-    var el = sessionList.querySelector('.session-item[data-session-key="' + key + '"]');
-    if (el) el.classList.toggle("unread", unread);
-  }
-
-  function bumpSessionCount(key, increment) {
-    var el = sessionList.querySelector('.session-meta[data-session-key="' + key + '"]');
-    if (!el) return;
-    var current = parseInt(el.textContent, 10) || 0;
-    var next = current + increment;
-    el.textContent = next + " msg" + (next !== 1 ? "s" : "");
   }
 
   function switchSession(key, searchContext) {
     activeSessionKey = key;
     localStorage.setItem("moltis-session", key);
-    msgBox.textContent = "";
+    if (chatMsgBox) chatMsgBox.textContent = "";
     streamEl = null;
     streamText = "";
-    // Update active highlight and clear unread without re-rendering the list.
+
     var items = sessionList.querySelectorAll(".session-item");
     items.forEach(function (el) {
       var isTarget = el.getAttribute("data-session-key") === key;
@@ -1016,34 +832,32 @@
         var msgEls = [];
         history.forEach(function (msg) {
           if (msg.role === "user") {
-            msgEls.push(addMsg("user", renderMarkdown(msg.content || ""), true));
+            msgEls.push(chatAddMsg("user", renderMarkdown(msg.content || ""), true));
           } else if (msg.role === "assistant") {
-            msgEls.push(addMsg("assistant", renderMarkdown(msg.content || ""), true));
+            msgEls.push(chatAddMsg("assistant", renderMarkdown(msg.content || ""), true));
           } else {
             msgEls.push(null);
           }
         });
 
-        // Scroll to matched message and highlight search terms.
-        if (searchContext && searchContext.query) {
+        if (searchContext && searchContext.query && chatMsgBox) {
           highlightAndScroll(msgEls, searchContext.messageIndex, searchContext.query);
         }
 
-        // Show thinking dots if this session is still waiting for a response.
         var item = sessionList.querySelector('.session-item[data-session-key="' + key + '"]');
-        if (item && item.classList.contains("replying")) {
+        if (item && item.classList.contains("replying") && chatMsgBox) {
           removeThinking();
           var thinkEl = document.createElement("div");
           thinkEl.className = "msg assistant thinking";
           thinkEl.id = "thinkingIndicator";
-          var dots = document.createElement("span");
-          dots.className = "thinking-dots";
-          dots.innerHTML = "<span></span><span></span><span></span>";
-          thinkEl.appendChild(dots);
-          msgBox.appendChild(thinkEl);
-          msgBox.scrollTop = msgBox.scrollHeight;
+          var thinkDots = document.createElement("span");
+          thinkDots.className = "thinking-dots";
+          // Safe: static hardcoded HTML, no user input
+          thinkDots.innerHTML = "<span></span><span></span><span></span>";
+          thinkEl.appendChild(thinkDots);
+          chatMsgBox.appendChild(thinkEl);
+          chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
         }
-        // If this is a new session, re-render the list to show it.
         if (!sessionList.querySelector('.session-meta[data-session-key="' + key + '"]')) {
           fetchSessions();
         }
@@ -1052,17 +866,10 @@
   }
 
   function highlightAndScroll(msgEls, messageIndex, query) {
-    // Find the target message element. messageIndex is the JSONL line index,
-    // but msgEls only includes user/assistant messages. We use it as a hint
-    // and fall back to the first element containing the query.
     var target = null;
-
-    // Try exact index first.
     if (messageIndex >= 0 && messageIndex < msgEls.length && msgEls[messageIndex]) {
       target = msgEls[messageIndex];
     }
-
-    // If the target doesn't contain the query, scan all messages.
     var lowerQ = query.toLowerCase();
     if (!target || (target.textContent || "").toLowerCase().indexOf(lowerQ) === -1) {
       for (var i = 0; i < msgEls.length; i++) {
@@ -1072,50 +879,37 @@
         }
       }
     }
-
     if (!target) return;
-
-    // Highlight all occurrences of the query in every message that contains it.
-    msgEls.forEach(function (el) {
-      if (el) highlightTermInElement(el, query);
-    });
-
-    // Scroll the target message into view.
+    msgEls.forEach(function (el) { if (el) highlightTermInElement(el, query); });
     target.scrollIntoView({ behavior: "smooth", block: "center" });
     target.classList.add("search-highlight-msg");
-
-    // Remove highlights after a delay.
     setTimeout(function () {
-      var marks = msgBox.querySelectorAll("mark.search-term-highlight");
-      marks.forEach(function (m) {
+      if (!chatMsgBox) return;
+      chatMsgBox.querySelectorAll("mark.search-term-highlight").forEach(function (m) {
         var parent = m.parentNode;
         parent.replaceChild(document.createTextNode(m.textContent), m);
         parent.normalize();
       });
-      var highlighted = msgBox.querySelectorAll(".search-highlight-msg");
-      highlighted.forEach(function (el) { el.classList.remove("search-highlight-msg"); });
+      chatMsgBox.querySelectorAll(".search-highlight-msg").forEach(function (el) {
+        el.classList.remove("search-highlight-msg");
+      });
     }, 5000);
   }
 
   function highlightTermInElement(el, query) {
-    // Walk text nodes and wrap matches in <mark> tags.
     var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
     var nodes = [];
     while (walker.nextNode()) nodes.push(walker.currentNode);
-
     var lowerQ = query.toLowerCase();
     nodes.forEach(function (textNode) {
       var text = textNode.nodeValue;
       var lowerText = text.toLowerCase();
       var idx = lowerText.indexOf(lowerQ);
       if (idx === -1) return;
-
       var frag = document.createDocumentFragment();
       var pos = 0;
       while (idx !== -1) {
-        if (idx > pos) {
-          frag.appendChild(document.createTextNode(text.substring(pos, idx)));
-        }
+        if (idx > pos) frag.appendChild(document.createTextNode(text.substring(pos, idx)));
         var mark = document.createElement("mark");
         mark.className = "search-term-highlight";
         mark.textContent = text.substring(idx, idx + query.length);
@@ -1123,144 +917,801 @@
         pos = idx + query.length;
         idx = lowerText.indexOf(lowerQ, pos);
       }
-      if (pos < text.length) {
-        frag.appendChild(document.createTextNode(text.substring(pos)));
-      }
+      if (pos < text.length) frag.appendChild(document.createTextNode(text.substring(pos)));
       textNode.parentNode.replaceChild(frag, textNode);
     });
   }
 
-  // ── Session search ───────────────────────────────────────────
-
-  var searchInput = $("sessionSearch");
-  var searchResults = $("searchResults");
-  var searchTimer = null;
-  var searchHits = [];
-  var searchIdx = -1;
-
-  function debounceSearch() {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(doSearch, 300);
-  }
-
-  function doSearch() {
-    var q = searchInput.value.trim();
-    if (!q || !connected) {
-      hideSearch();
-      return;
-    }
-    sendRpc("sessions.search", { query: q }).then(function (res) {
-      if (!res || !res.ok) { hideSearch(); return; }
-      searchHits = res.payload || [];
-      searchIdx = -1;
-      renderSearchResults(q);
-    });
-  }
-
-  function hideSearch() {
-    searchResults.classList.add("hidden");
-    searchHits = [];
-    searchIdx = -1;
-  }
-
-  function renderSearchResults(query) {
-    searchResults.textContent = "";
-    if (searchHits.length === 0) {
-      var empty = document.createElement("div");
-      empty.style.padding = "8px 10px";
-      empty.style.fontSize = ".78rem";
-      empty.style.color = "var(--muted)";
-      empty.textContent = "No results";
-      searchResults.appendChild(empty);
-      searchResults.classList.remove("hidden");
-      return;
-    }
-    searchHits.forEach(function (hit, i) {
-      var el = document.createElement("div");
-      el.className = "search-hit";
-      el.setAttribute("data-idx", i);
-
-      var lbl = document.createElement("div");
-      lbl.className = "search-hit-label";
-      lbl.textContent = hit.label || hit.sessionKey;
-      el.appendChild(lbl);
-
-      var snip = document.createElement("div");
-      snip.className = "search-hit-snippet";
-      // Highlight matched text safely: esc() escapes all HTML entities first,
-      // then we only wrap the already-escaped query in <mark> tags.
-      var escaped = esc(hit.snippet);
-      var qEsc = esc(query);
-      var re = new RegExp("(" + qEsc.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
-      snip.innerHTML = escaped.replace(re, "<mark>$1</mark>");
-      el.appendChild(snip);
-
-      var role = document.createElement("div");
-      role.className = "search-hit-role";
-      role.textContent = hit.role;
-      el.appendChild(role);
-
-      el.addEventListener("click", function () {
-        var ctx = { query: query, messageIndex: hit.messageIndex };
-        switchSession(hit.sessionKey, ctx);
-        searchInput.value = "";
-        hideSearch();
-      });
-
-      searchResults.appendChild(el);
-    });
-    searchResults.classList.remove("hidden");
-  }
-
-  function updateSearchActive() {
-    var items = searchResults.querySelectorAll(".search-hit");
-    items.forEach(function (el, i) {
-      el.classList.toggle("kb-active", i === searchIdx);
-    });
-    if (searchIdx >= 0 && items[searchIdx]) {
-      items[searchIdx].scrollIntoView({ block: "nearest" });
-    }
-  }
-
-  searchInput.addEventListener("input", debounceSearch);
-
-  searchInput.addEventListener("keydown", function (e) {
-    if (searchResults.classList.contains("hidden")) return;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      searchIdx = Math.min(searchIdx + 1, searchHits.length - 1);
-      updateSearchActive();
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      searchIdx = Math.max(searchIdx - 1, 0);
-      updateSearchActive();
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      if (searchIdx >= 0 && searchHits[searchIdx]) {
-        var h = searchHits[searchIdx];
-        var ctx = { query: searchInput.value.trim(), messageIndex: h.messageIndex };
-        switchSession(h.sessionKey, ctx);
-        searchInput.value = "";
-        hideSearch();
+  function sendChat() {
+    var text = chatInput.value.trim();
+    if (!text || !connected) return;
+    chatInput.value = "";
+    chatAutoResize();
+    chatAddMsg("user", renderMarkdown(text), true);
+    var chatParams = { text: text };
+    var selectedModel = modelSelect.value;
+    if (selectedModel) chatParams.model = selectedModel;
+    bumpSessionCount(activeSessionKey, 1);
+    setSessionReplying(activeSessionKey, true);
+    sendRpc("chat.send", chatParams).then(function (res) {
+      if (res && !res.ok && res.error) {
+        chatAddMsg("error", res.error.message || "Request failed");
       }
-    } else if (e.key === "Escape") {
-      searchInput.value = "";
-      hideSearch();
+    });
+  }
+
+  function chatAutoResize() {
+    if (!chatInput) return;
+    chatInput.style.height = "auto";
+    chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + "px";
+  }
+
+  // Safe: static hardcoded HTML template, no user input.
+  var chatPageHTML =
+    '<div class="flex-1 flex flex-col min-w-0">' +
+      '<div class="flex-1 overflow-y-auto p-4 flex flex-col gap-2" id="messages"></div>' +
+      '<div class="px-4 py-3 border-t border-[var(--border)] bg-[var(--surface)] flex gap-2 items-end">' +
+        '<textarea id="chatInput" placeholder="Type a message..." rows="1" ' +
+          'class="flex-1 bg-[var(--surface2)] border border-[var(--border)] text-[var(--text)] px-3 py-2 rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] leading-relaxed focus:outline-none focus:border-[var(--border-strong)] focus:ring-1 focus:ring-[var(--accent-subtle)] transition-colors font-[var(--font-body)]"></textarea>' +
+        '<button id="sendBtn" disabled ' +
+          'class="bg-[var(--accent-dim)] text-white border-none px-4 py-2 rounded-lg cursor-pointer text-sm font-medium whitespace-nowrap hover:bg-[var(--accent)] disabled:opacity-40 disabled:cursor-default transition-colors">Send</button>' +
+      '</div></div>';
+
+  registerPage("/", function initChat(container) {
+    container.innerHTML = chatPageHTML;
+
+    chatMsgBox = $("messages");
+    chatInput = $("chatInput");
+    chatSendBtn = $("sendBtn");
+
+    if (connected) chatSendBtn.disabled = false;
+
+    chatInput.addEventListener("input", chatAutoResize);
+    chatInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+    });
+    chatSendBtn.addEventListener("click", sendChat);
+
+    if (connected) switchSession(activeSessionKey);
+    chatInput.focus();
+  }, function teardownChat() {
+    chatMsgBox = null;
+    chatInput = null;
+    chatSendBtn = null;
+    streamEl = null;
+    streamText = "";
+  });
+
+  // ════════════════════════════════════════════════════════════
+  // Methods page
+  // ════════════════════════════════════════════════════════════
+  // Safe: static hardcoded HTML template, no user input.
+  var methodsPageHTML =
+    '<div class="flex-1 flex flex-col min-w-0 p-4 gap-3">' +
+      '<h2 class="text-lg font-medium text-[var(--text-strong)]">Method Explorer</h2>' +
+      '<div><label class="text-xs text-[var(--muted)] block mb-1">Method</label>' +
+        '<input id="rpcMethod" placeholder="e.g. health" value="health" class="w-full bg-[var(--surface2)] border border-[var(--border)] text-[var(--text)] px-2 py-1.5 rounded text-xs font-[var(--font-mono)] focus:outline-none focus:border-[var(--border-strong)]" style="max-width:400px"></div>' +
+      '<div><label class="text-xs text-[var(--muted)] block mb-1">Params (JSON, optional)</label>' +
+        '<textarea id="rpcParams" placeholder="{}" class="w-full bg-[var(--surface2)] border border-[var(--border)] text-[var(--text)] px-2 py-1.5 rounded text-xs font-[var(--font-mono)] min-h-[80px] resize-y focus:outline-none focus:border-[var(--border-strong)]" style="max-width:400px"></textarea></div>' +
+      '<button id="rpcSend" class="bg-[var(--accent-dim)] text-white border-none px-3 py-1.5 rounded text-xs cursor-pointer hover:bg-[var(--accent)] transition-colors self-start">Call</button>' +
+      '<div><label class="text-xs text-[var(--muted)] block mb-1">Response</label>' +
+        '<div class="methods-result" id="rpcResult"></div></div></div>';
+
+  registerPage("/methods", function initMethods(container) {
+    container.innerHTML = methodsPageHTML;
+
+    var rpcMethod = $("rpcMethod");
+    var rpcParams = $("rpcParams");
+    var rpcSend = $("rpcSend");
+    var rpcResult = $("rpcResult");
+
+    rpcSend.addEventListener("click", function () {
+      var method = rpcMethod.value.trim();
+      if (!method || !connected) return;
+      var params;
+      var raw = rpcParams.value.trim();
+      if (raw) {
+        try { params = JSON.parse(raw); } catch (e) {
+          rpcResult.textContent = "Invalid JSON: " + e.message;
+          return;
+        }
+      }
+      rpcResult.textContent = "calling...";
+      sendRpc(method, params).then(function (res) {
+        rpcResult.textContent = JSON.stringify(res, null, 2);
+      });
+    });
+  });
+
+  // ════════════════════════════════════════════════════════════
+  // Crons page
+  // ════════════════════════════════════════════════════════════
+  // Safe: static hardcoded HTML template, no user input.
+  var cronsPageHTML =
+    '<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">' +
+      '<div class="flex items-center gap-3">' +
+        '<h2 class="text-lg font-medium text-[var(--text-strong)]">Cron Jobs</h2>' +
+        '<button id="cronAddBtn" class="bg-[var(--accent-dim)] text-white border-none px-3 py-1.5 rounded text-xs cursor-pointer hover:bg-[var(--accent)] transition-colors">+ Add Job</button>' +
+        '<button id="cronRefreshBtn" class="text-xs text-[var(--muted)] border border-[var(--border)] px-2.5 py-1 rounded-md hover:text-[var(--text)] hover:border-[var(--border-strong)] transition-colors cursor-pointer bg-transparent">Refresh</button>' +
+      '</div>' +
+      '<div id="cronStatusBar" class="cron-status-bar"></div>' +
+      '<div id="cronJobList"></div>' +
+      '<div id="cronRunsPanel" class="hidden"></div>' +
+    '</div>';
+
+  registerPage("/crons", function initCrons(container) {
+    container.innerHTML = cronsPageHTML;
+
+    var cronStatusBar = $("cronStatusBar");
+    var cronJobList = $("cronJobList");
+    var cronRunsPanel = $("cronRunsPanel");
+
+    function loadStatus() {
+      sendRpc("cron.status", {}).then(function (res) {
+        if (!res || !res.ok) { cronStatusBar.textContent = "Failed to load status"; return; }
+        var s = res.payload;
+        var parts = [
+          s.running ? "Running" : "Stopped",
+          s.jobCount + " job" + (s.jobCount !== 1 ? "s" : ""),
+          s.enabledCount + " enabled"
+        ];
+        if (s.nextRunAtMs) {
+          parts.push("next: " + new Date(s.nextRunAtMs).toLocaleString());
+        }
+        cronStatusBar.textContent = parts.join(" \u2022 ");
+      });
+    }
+
+    function loadJobs() {
+      sendRpc("cron.list", {}).then(function (res) {
+        if (!res || !res.ok) { cronJobList.textContent = "Failed to load jobs"; return; }
+        renderJobTable(res.payload || []);
+      });
+    }
+
+    function renderJobTable(jobs) {
+      cronJobList.textContent = "";
+      if (jobs.length === 0) {
+        var empty = document.createElement("div");
+        empty.className = "text-sm text-[var(--muted)]";
+        empty.textContent = "No cron jobs configured.";
+        cronJobList.appendChild(empty);
+        return;
+      }
+      var table = document.createElement("table");
+      table.className = "cron-table";
+
+      var thead = document.createElement("thead");
+      var headRow = document.createElement("tr");
+      ["Name", "Schedule", "Enabled", "Next Run", "Last Status", "Actions"].forEach(function (h) {
+        var th = document.createElement("th");
+        th.textContent = h;
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      var tbody = document.createElement("tbody");
+      jobs.forEach(function (job) {
+        var tr = document.createElement("tr");
+
+        var tdName = document.createElement("td");
+        tdName.textContent = job.name;
+        tr.appendChild(tdName);
+
+        var tdSched = document.createElement("td");
+        tdSched.textContent = formatSchedule(job.schedule);
+        tdSched.style.fontFamily = "var(--font-mono)";
+        tdSched.style.fontSize = ".78rem";
+        tr.appendChild(tdSched);
+
+        var tdEnabled = document.createElement("td");
+        var toggle = document.createElement("label");
+        toggle.className = "cron-toggle";
+        var checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = job.enabled;
+        checkbox.addEventListener("change", function () {
+          sendRpc("cron.update", { id: job.id, patch: { enabled: checkbox.checked } }).then(function () {
+            loadStatus();
+          });
+        });
+        toggle.appendChild(checkbox);
+        var slider = document.createElement("span");
+        slider.className = "cron-slider";
+        toggle.appendChild(slider);
+        tdEnabled.appendChild(toggle);
+        tr.appendChild(tdEnabled);
+
+        var tdNext = document.createElement("td");
+        tdNext.style.fontSize = ".78rem";
+        tdNext.textContent = job.state && job.state.nextRunAtMs
+          ? new Date(job.state.nextRunAtMs).toLocaleString()
+          : "\u2014";
+        tr.appendChild(tdNext);
+
+        var tdStatus = document.createElement("td");
+        if (job.state && job.state.lastStatus) {
+          var badge = document.createElement("span");
+          badge.className = "cron-badge " + job.state.lastStatus;
+          badge.textContent = job.state.lastStatus;
+          tdStatus.appendChild(badge);
+        } else {
+          tdStatus.textContent = "\u2014";
+        }
+        tr.appendChild(tdStatus);
+
+        var tdActions = document.createElement("td");
+        tdActions.className = "cron-actions";
+
+        var editBtn = document.createElement("button");
+        editBtn.className = "cron-action-btn";
+        editBtn.textContent = "Edit";
+        editBtn.addEventListener("click", function () { openCronModal(job); });
+        tdActions.appendChild(editBtn);
+
+        var runBtn = document.createElement("button");
+        runBtn.className = "cron-action-btn";
+        runBtn.textContent = "Run";
+        runBtn.addEventListener("click", function () {
+          sendRpc("cron.run", { id: job.id, force: true }).then(function () {
+            loadJobs();
+            loadStatus();
+          });
+        });
+        tdActions.appendChild(runBtn);
+
+        var histBtn = document.createElement("button");
+        histBtn.className = "cron-action-btn";
+        histBtn.textContent = "History";
+        histBtn.addEventListener("click", function () { showRunHistory(job.id, job.name); });
+        tdActions.appendChild(histBtn);
+
+        var delBtn = document.createElement("button");
+        delBtn.className = "cron-action-btn cron-action-danger";
+        delBtn.textContent = "Delete";
+        delBtn.addEventListener("click", function () {
+          if (confirm("Delete job '" + job.name + "'?")) {
+            sendRpc("cron.remove", { id: job.id }).then(function () {
+              loadJobs();
+              loadStatus();
+            });
+          }
+        });
+        tdActions.appendChild(delBtn);
+
+        tr.appendChild(tdActions);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      cronJobList.appendChild(table);
+    }
+
+    function formatSchedule(sched) {
+      if (sched.kind === "at") return "At " + new Date(sched.atMs).toLocaleString();
+      if (sched.kind === "every") {
+        var ms = sched.everyMs;
+        if (ms >= 3600000) return "Every " + (ms / 3600000) + "h";
+        if (ms >= 60000) return "Every " + (ms / 60000) + "m";
+        return "Every " + (ms / 1000) + "s";
+      }
+      if (sched.kind === "cron") return sched.expr + (sched.tz ? " (" + sched.tz + ")" : "");
+      return JSON.stringify(sched);
+    }
+
+    function showRunHistory(jobId, jobName) {
+      cronRunsPanel.classList.remove("hidden");
+      cronRunsPanel.textContent = "";
+      var loading = document.createElement("div");
+      loading.className = "text-sm text-[var(--muted)]";
+      loading.textContent = "Loading history for " + jobName + "...";
+      cronRunsPanel.appendChild(loading);
+
+      sendRpc("cron.runs", { id: jobId }).then(function (res) {
+        cronRunsPanel.textContent = "";
+        if (!res || !res.ok) {
+          var errEl = document.createElement("div");
+          errEl.className = "text-sm text-[var(--error)]";
+          errEl.textContent = "Failed to load history";
+          cronRunsPanel.appendChild(errEl);
+          return;
+        }
+        var runs = res.payload || [];
+
+        var header = document.createElement("div");
+        header.className = "flex items-center justify-between";
+        header.style.marginBottom = "8px";
+        var titleEl = document.createElement("span");
+        titleEl.className = "text-sm font-medium text-[var(--text-strong)]";
+        titleEl.textContent = "Run History: " + jobName;
+        header.appendChild(titleEl);
+        var closeBtn = document.createElement("button");
+        closeBtn.className = "text-xs text-[var(--muted)] cursor-pointer bg-transparent border-none hover:text-[var(--text)]";
+        closeBtn.textContent = "\u2715 Close";
+        closeBtn.addEventListener("click", function () { cronRunsPanel.classList.add("hidden"); });
+        header.appendChild(closeBtn);
+        cronRunsPanel.appendChild(header);
+
+        if (runs.length === 0) {
+          var emptyEl = document.createElement("div");
+          emptyEl.className = "text-xs text-[var(--muted)]";
+          emptyEl.textContent = "No runs yet.";
+          cronRunsPanel.appendChild(emptyEl);
+          return;
+        }
+
+        runs.forEach(function (run) {
+          var item = document.createElement("div");
+          item.className = "cron-run-item";
+
+          var time = document.createElement("span");
+          time.className = "text-xs text-[var(--muted)]";
+          time.textContent = new Date(run.startedAtMs).toLocaleString();
+          item.appendChild(time);
+
+          var badge = document.createElement("span");
+          badge.className = "cron-badge " + run.status;
+          badge.textContent = run.status;
+          item.appendChild(badge);
+
+          var dur = document.createElement("span");
+          dur.className = "text-xs text-[var(--muted)]";
+          dur.textContent = run.durationMs + "ms";
+          item.appendChild(dur);
+
+          if (run.error) {
+            var errSpan = document.createElement("span");
+            errSpan.className = "text-xs text-[var(--error)]";
+            errSpan.textContent = run.error;
+            item.appendChild(errSpan);
+          }
+
+          cronRunsPanel.appendChild(item);
+        });
+      });
+    }
+
+    function openCronModal(existingJob) {
+      var isEdit = !!existingJob;
+      providerModal.classList.remove("hidden");
+      providerModalTitle.textContent = isEdit ? "Edit Job" : "Add Job";
+      providerModalBody.textContent = "";
+
+      var form = document.createElement("div");
+      form.className = "provider-key-form";
+
+      function addField(labelText, el) {
+        var lbl = document.createElement("label");
+        lbl.className = "text-xs text-[var(--muted)]";
+        lbl.textContent = labelText;
+        form.appendChild(lbl);
+        form.appendChild(el);
+      }
+
+      var nameInput = document.createElement("input");
+      nameInput.className = "provider-key-input";
+      nameInput.placeholder = "Job name";
+      nameInput.value = isEdit ? existingJob.name : "";
+      addField("Name", nameInput);
+
+      var schedSelect = document.createElement("select");
+      schedSelect.className = "provider-key-input";
+      ["at", "every", "cron"].forEach(function (k) {
+        var opt = document.createElement("option");
+        opt.value = k;
+        opt.textContent = k === "at" ? "At (one-shot)" : k === "every" ? "Every (interval)" : "Cron (expression)";
+        schedSelect.appendChild(opt);
+      });
+      addField("Schedule Type", schedSelect);
+
+      var schedParams = document.createElement("div");
+      form.appendChild(schedParams);
+
+      var schedAtInput = document.createElement("input");
+      schedAtInput.className = "provider-key-input";
+      schedAtInput.type = "datetime-local";
+
+      var schedEveryInput = document.createElement("input");
+      schedEveryInput.className = "provider-key-input";
+      schedEveryInput.type = "number";
+      schedEveryInput.placeholder = "Interval in seconds";
+      schedEveryInput.min = "1";
+
+      var schedCronInput = document.createElement("input");
+      schedCronInput.className = "provider-key-input";
+      schedCronInput.placeholder = "*/5 * * * *";
+
+      var schedTzInput = document.createElement("input");
+      schedTzInput.className = "provider-key-input";
+      schedTzInput.placeholder = "Timezone (optional, e.g. Europe/Paris)";
+
+      function updateSchedParams() {
+        schedParams.textContent = "";
+        var kind = schedSelect.value;
+        if (kind === "at") {
+          schedParams.appendChild(schedAtInput);
+        } else if (kind === "every") {
+          schedParams.appendChild(schedEveryInput);
+        } else {
+          schedParams.appendChild(schedCronInput);
+          schedParams.appendChild(schedTzInput);
+        }
+      }
+      schedSelect.addEventListener("change", updateSchedParams);
+
+      var payloadSelect = document.createElement("select");
+      payloadSelect.className = "provider-key-input";
+      ["systemEvent", "agentTurn"].forEach(function (k) {
+        var opt = document.createElement("option");
+        opt.value = k;
+        opt.textContent = k === "systemEvent" ? "System Event" : "Agent Turn";
+        payloadSelect.appendChild(opt);
+      });
+      addField("Payload Type", payloadSelect);
+
+      var payloadTextInput = document.createElement("textarea");
+      payloadTextInput.className = "provider-key-input";
+      payloadTextInput.placeholder = "Message text";
+      payloadTextInput.style.minHeight = "60px";
+      payloadTextInput.style.resize = "vertical";
+      addField("Message", payloadTextInput);
+
+      var targetSelect = document.createElement("select");
+      targetSelect.className = "provider-key-input";
+      ["isolated", "main"].forEach(function (k) {
+        var opt = document.createElement("option");
+        opt.value = k;
+        opt.textContent = k.charAt(0).toUpperCase() + k.slice(1);
+        targetSelect.appendChild(opt);
+      });
+      addField("Session Target", targetSelect);
+
+      var deleteAfterLabel = document.createElement("label");
+      deleteAfterLabel.className = "text-xs text-[var(--muted)] flex items-center gap-2";
+      var deleteAfterCheck = document.createElement("input");
+      deleteAfterCheck.type = "checkbox";
+      deleteAfterLabel.appendChild(deleteAfterCheck);
+      deleteAfterLabel.appendChild(document.createTextNode("Delete after run"));
+      form.appendChild(deleteAfterLabel);
+
+      var enabledLabel = document.createElement("label");
+      enabledLabel.className = "text-xs text-[var(--muted)] flex items-center gap-2";
+      var enabledCheck = document.createElement("input");
+      enabledCheck.type = "checkbox";
+      enabledCheck.checked = true;
+      enabledLabel.appendChild(enabledCheck);
+      enabledLabel.appendChild(document.createTextNode("Enabled"));
+      form.appendChild(enabledLabel);
+
+      if (isEdit) {
+        var s = existingJob.schedule;
+        schedSelect.value = s.kind;
+        if (s.kind === "at" && s.atMs) {
+          schedAtInput.value = new Date(s.atMs).toISOString().slice(0, 16);
+        } else if (s.kind === "every" && s.everyMs) {
+          schedEveryInput.value = Math.round(s.everyMs / 1000);
+        } else if (s.kind === "cron") {
+          schedCronInput.value = s.expr || "";
+          schedTzInput.value = s.tz || "";
+        }
+
+        var p = existingJob.payload;
+        payloadSelect.value = p.kind;
+        payloadTextInput.value = p.text || p.message || "";
+        targetSelect.value = existingJob.sessionTarget || "isolated";
+        deleteAfterCheck.checked = existingJob.deleteAfterRun || false;
+        enabledCheck.checked = existingJob.enabled;
+      }
+
+      updateSchedParams();
+
+      var btns = document.createElement("div");
+      btns.style.display = "flex";
+      btns.style.gap = "8px";
+      btns.style.marginTop = "8px";
+
+      var cancelBtn = document.createElement("button");
+      cancelBtn.className = "provider-btn provider-btn-secondary";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", closeProviderModal);
+      btns.appendChild(cancelBtn);
+
+      var saveBtn = document.createElement("button");
+      saveBtn.className = "provider-btn";
+      saveBtn.textContent = isEdit ? "Update" : "Create";
+      saveBtn.addEventListener("click", function () {
+        var name = nameInput.value.trim();
+        if (!name) { nameInput.style.borderColor = "var(--error)"; return; }
+
+        var schedule;
+        var kind = schedSelect.value;
+        if (kind === "at") {
+          var ts = new Date(schedAtInput.value).getTime();
+          if (isNaN(ts)) { schedAtInput.style.borderColor = "var(--error)"; return; }
+          schedule = { kind: "at", atMs: ts };
+        } else if (kind === "every") {
+          var secs = parseInt(schedEveryInput.value, 10);
+          if (isNaN(secs) || secs <= 0) { schedEveryInput.style.borderColor = "var(--error)"; return; }
+          schedule = { kind: "every", everyMs: secs * 1000 };
+        } else {
+          var expr = schedCronInput.value.trim();
+          if (!expr) { schedCronInput.style.borderColor = "var(--error)"; return; }
+          schedule = { kind: "cron", expr: expr };
+          var tz = schedTzInput.value.trim();
+          if (tz) schedule.tz = tz;
+        }
+
+        var msgText = payloadTextInput.value.trim();
+        if (!msgText) { payloadTextInput.style.borderColor = "var(--error)"; return; }
+        var payload;
+        if (payloadSelect.value === "systemEvent") {
+          payload = { kind: "systemEvent", text: msgText };
+        } else {
+          payload = { kind: "agentTurn", message: msgText, deliver: false };
+        }
+
+        saveBtn.disabled = true;
+        saveBtn.textContent = "Saving...";
+
+        if (isEdit) {
+          sendRpc("cron.update", { id: existingJob.id, patch: {
+            name: name, schedule: schedule, payload: payload,
+            sessionTarget: targetSelect.value,
+            deleteAfterRun: deleteAfterCheck.checked,
+            enabled: enabledCheck.checked
+          }}).then(function (res) {
+            if (res && res.ok) { closeProviderModal(); loadJobs(); loadStatus(); }
+            else { saveBtn.disabled = false; saveBtn.textContent = "Update"; }
+          });
+        } else {
+          sendRpc("cron.add", {
+            name: name, schedule: schedule, payload: payload,
+            sessionTarget: targetSelect.value,
+            deleteAfterRun: deleteAfterCheck.checked,
+            enabled: enabledCheck.checked
+          }).then(function (res) {
+            if (res && res.ok) { closeProviderModal(); loadJobs(); loadStatus(); }
+            else { saveBtn.disabled = false; saveBtn.textContent = "Create"; }
+          });
+        }
+      });
+      btns.appendChild(saveBtn);
+      form.appendChild(btns);
+
+      providerModalBody.appendChild(form);
+      nameInput.focus();
+    }
+
+    $("cronAddBtn").addEventListener("click", function () { openCronModal(null); });
+    $("cronRefreshBtn").addEventListener("click", function () { loadJobs(); loadStatus(); });
+
+    loadStatus();
+    loadJobs();
+  });
+
+  // ── WebSocket ─────────────────────────────────────────────
+  function connect() {
+    setStatus("connecting", "connecting...");
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/ws");
+
+    ws.onopen = function () {
+      var id = nextId();
+      ws.send(JSON.stringify({
+        type: "req", id: id, method: "connect",
+        params: {
+          minProtocol: 3, maxProtocol: 3,
+          client: { id: "web-chat-ui", version: "0.1.0", platform: "browser", mode: "operator" }
+        }
+      }));
+      pending[id] = function (frame) {
+        var hello = frame.ok && frame.payload;
+        if (hello && hello.type === "hello-ok") {
+          connected = true;
+          reconnectDelay = 1000;
+          setStatus("connected", "connected (v" + hello.protocol + ")");
+          var now = new Date();
+          var ts = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+          chatAddMsg("system", "Connected to moltis gateway v" + hello.server.version + " at " + ts);
+          fetchModels();
+          fetchSessions();
+          if (currentPage === "/") switchSession(activeSessionKey);
+        } else {
+          setStatus("", "handshake failed");
+          var reason = (frame.error && frame.error.message) || "unknown error";
+          chatAddMsg("error", "Handshake failed: " + reason);
+        }
+      };
+    };
+
+    ws.onmessage = function (evt) {
+      var frame;
+      try { frame = JSON.parse(evt.data); } catch (e) { return; }
+
+      if (frame.type === "res") {
+        var cb = pending[frame.id];
+        if (cb) { delete pending[frame.id]; cb(frame); }
+        return;
+      }
+
+      if (frame.type === "event") {
+        if (frame.event === "chat") {
+          var p = frame.payload || {};
+          var eventSession = p.sessionKey || activeSessionKey;
+          var isActive = eventSession === activeSessionKey;
+          var isChatPage = currentPage === "/";
+
+          if (p.state === "thinking" && isActive && isChatPage) {
+            removeThinking();
+            var thinkEl = document.createElement("div");
+            thinkEl.className = "msg assistant thinking";
+            thinkEl.id = "thinkingIndicator";
+            var thinkDots = document.createElement("span");
+            thinkDots.className = "thinking-dots";
+            // Safe: static hardcoded HTML, no user input
+            thinkDots.innerHTML = "<span></span><span></span><span></span>";
+            thinkEl.appendChild(thinkDots);
+            chatMsgBox.appendChild(thinkEl);
+            chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+          } else if (p.state === "thinking_done" && isActive && isChatPage) {
+            removeThinking();
+          } else if (p.state === "tool_call_start" && isActive && isChatPage) {
+            removeThinking();
+            var card = document.createElement("div");
+            card.className = "msg exec-card running";
+            card.id = "tool-" + p.toolCallId;
+            var prompt = document.createElement("div");
+            prompt.className = "exec-prompt";
+            var cmd = (p.toolName === "exec" && p.arguments && p.arguments.command)
+              ? p.arguments.command : (p.toolName || "tool");
+            var promptChar = document.createElement("span");
+            promptChar.className = "exec-prompt-char";
+            promptChar.textContent = "$";
+            prompt.appendChild(promptChar);
+            var cmdSpan = document.createElement("span");
+            cmdSpan.textContent = " " + cmd;
+            prompt.appendChild(cmdSpan);
+            card.appendChild(prompt);
+            var spin = document.createElement("div");
+            spin.className = "exec-status";
+            spin.textContent = "running\u2026";
+            card.appendChild(spin);
+            chatMsgBox.appendChild(card);
+            chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+          } else if (p.state === "tool_call_end" && isActive && isChatPage) {
+            var toolCard = document.getElementById("tool-" + p.toolCallId);
+            if (toolCard) {
+              toolCard.className = "msg exec-card " + (p.success ? "exec-ok" : "exec-err");
+              var toolSpin = toolCard.querySelector(".exec-status");
+              if (toolSpin) toolSpin.remove();
+              if (p.success && p.result) {
+                var out = (p.result.stdout || "").replace(/\n+$/, "");
+                lastToolOutput = out;
+                if (out) {
+                  var outEl = document.createElement("pre");
+                  outEl.className = "exec-output";
+                  outEl.textContent = out;
+                  toolCard.appendChild(outEl);
+                }
+                var stderrText = (p.result.stderr || "").replace(/\n+$/, "");
+                if (stderrText) {
+                  var errEl = document.createElement("pre");
+                  errEl.className = "exec-output exec-stderr";
+                  errEl.textContent = stderrText;
+                  toolCard.appendChild(errEl);
+                }
+                if (p.result.exit_code !== undefined && p.result.exit_code !== 0) {
+                  var codeEl = document.createElement("div");
+                  codeEl.className = "exec-exit";
+                  codeEl.textContent = "exit " + p.result.exit_code;
+                  toolCard.appendChild(codeEl);
+                }
+              } else if (!p.success && p.error && p.error.detail) {
+                var errMsg = document.createElement("div");
+                errMsg.className = "exec-error-detail";
+                errMsg.textContent = p.error.detail;
+                toolCard.appendChild(errMsg);
+              }
+            }
+          } else if (p.state === "delta" && p.text && isActive && isChatPage) {
+            removeThinking();
+            if (!streamEl) {
+              streamText = "";
+              streamEl = document.createElement("div");
+              streamEl.className = "msg assistant";
+              chatMsgBox.appendChild(streamEl);
+            }
+            streamText += p.text;
+            // Safe: renderMarkdown calls esc() first to escape all HTML entities,
+            // then only adds our own formatting tags (pre, code, strong).
+            streamEl.innerHTML = renderMarkdown(streamText);
+            chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+          } else if (p.state === "final") {
+            bumpSessionCount(eventSession, 1);
+            setSessionReplying(eventSession, false);
+            if (!isActive) {
+              setSessionUnread(eventSession, true);
+            }
+            if (isActive && isChatPage) {
+              removeThinking();
+              var isEcho = lastToolOutput && p.text
+                && p.text.replace(/[`\s]/g, "").indexOf(lastToolOutput.replace(/\s/g, "").substring(0, 80)) !== -1;
+              var msgEl = null;
+              if (!isEcho) {
+                if (p.text && streamEl) {
+                  // Safe: renderMarkdown calls esc() first
+                  streamEl.innerHTML = renderMarkdown(p.text);
+                  msgEl = streamEl;
+                } else if (p.text && !streamEl) {
+                  msgEl = chatAddMsg("assistant", renderMarkdown(p.text), true);
+                }
+              } else if (streamEl) {
+                streamEl.remove();
+              }
+              if (msgEl && p.model) {
+                var footer = document.createElement("div");
+                footer.className = "msg-model-footer";
+                footer.textContent = p.provider ? p.provider + " / " + p.model : p.model;
+                msgEl.appendChild(footer);
+              }
+              streamEl = null;
+              streamText = "";
+              lastToolOutput = "";
+            }
+          } else if (p.state === "error") {
+            setSessionReplying(eventSession, false);
+            if (isActive && isChatPage) {
+              removeThinking();
+              if (p.error && p.error.title) {
+                chatAddErrorCard(p.error);
+              } else {
+                chatAddErrorMsg(p.message || "unknown");
+              }
+              streamEl = null;
+              streamText = "";
+            }
+          }
+        }
+        if (frame.event === "exec.approval.requested") {
+          var ap = frame.payload || {};
+          renderApprovalCard(ap.requestId, ap.command);
+        }
+        return;
+      }
+    };
+
+    ws.onclose = function () {
+      connected = false;
+      setStatus("", "disconnected \u2014 reconnecting\u2026");
+      streamEl = null;
+      streamText = "";
+      scheduleReconnect();
+    };
+
+    ws.onerror = function () {};
+  }
+
+  var reconnectTimer = null;
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+      connect();
+    }, reconnectDelay);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && !connected) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      reconnectDelay = 1000;
+      connect();
     }
   });
 
-  // Close search when clicking outside
-  document.addEventListener("click", function (e) {
-    if (!searchInput.contains(e.target) && !searchResults.contains(e.target)) {
-      hideSearch();
-    }
-  });
-
-  newSessionBtn.addEventListener("click", function () {
-    var key = "session:" + crypto.randomUUID();
-    switchSession(key);
-  });
-
+  // ── Boot ──────────────────────────────────────────────────
   connect();
-  input.focus();
+  mount(location.pathname);
 })();
