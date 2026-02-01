@@ -152,12 +152,13 @@ impl HookHandler for ShellHookHandler {
         }
 
         match serde_json::from_str::<ShellHookResponse>(stdout_trimmed) {
-            Ok(resp) if resp.action == "modify" => match resp.data {
-                Some(data) => Ok(HookAction::ModifyPayload(data)),
-                None => {
+            Ok(resp) if resp.action == "modify" => {
+                if let Some(data) = resp.data {
+                    Ok(HookAction::ModifyPayload(data))
+                } else {
                     warn!(hook = %self.hook_name, "modify action without data, continuing");
                     Ok(HookAction::Continue)
-                },
+                }
             },
             Ok(_) => Ok(HookAction::Continue),
             Err(e) => {

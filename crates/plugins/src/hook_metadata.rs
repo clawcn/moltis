@@ -89,13 +89,12 @@ pub fn parse_hook_md(content: &str, source_path: &Path) -> Result<ParsedHook> {
         .find("\n+++")
         .context("missing closing +++ in HOOK.md frontmatter")?;
 
-    let toml_str = &after_first[..end].trim();
+    let toml_str = after_first[..end].trim();
     let body_start = end + 4; // skip "\n+++"
-    let body = if body_start < after_first.len() {
-        after_first[body_start..].trim().to_string()
-    } else {
-        String::new()
-    };
+    let body = after_first
+        .get(body_start..)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
     let metadata: HookMetadata =
         toml::from_str(toml_str).context("failed to parse HOOK.md TOML frontmatter")?;

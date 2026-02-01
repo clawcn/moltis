@@ -134,11 +134,11 @@ impl ChatService for LiveChatService {
             .map(String::from);
         let explicit_model = params.get("model").and_then(|v| v.as_str());
         // Use streaming-only mode if explicitly requested or if no tools are registered.
-        let stream_only = params
+        let explicit_stream_only = params
             .get("stream_only")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || !self.has_tools();
+            .unwrap_or(false);
+        let stream_only = explicit_stream_only || !self.has_tools();
 
         // Resolve session key: explicit override (used by cron callbacks) or
         // connection-scoped lookup.
@@ -286,6 +286,7 @@ impl ChatService for LiveChatService {
         let is_web_message = conn_id.is_some()
             && params.get("_session_key").is_none()
             && params.get("channel").is_none();
+
         if is_web_message
             && let Some(entry) = self.session_metadata.get(&session_key).await
             && let Some(ref binding_json) = entry.channel_binding
@@ -298,11 +299,10 @@ impl ChatService for LiveChatService {
                 .get_active_session(&target.channel_type, &target.account_id, &target.chat_id)
                 .await
                 .map(|k| k == session_key)
-                .unwrap_or(true); // no override → deterministic key is active
+                .unwrap_or(true);
 
             if is_active {
-                // Push reply target so deliver_channel_replies sends the LLM
-                // response to the channel.
+                // Push reply target so deliver_channel_replies sends the LLM response.
                 self.state
                     .push_channel_reply(&session_key, target.clone())
                     .await;
@@ -372,17 +372,16 @@ impl ChatService for LiveChatService {
         // Compute session context stats for the system prompt.
         let session_stats = {
             let msg_count = history.len() + 1; // +1 for the current user message
-            let mut total_input: u64 = 0;
-            let mut total_output: u64 = 0;
-            for msg in &history {
-                if let Some(t) = msg.get("inputTokens").and_then(|v| v.as_u64()) {
-                    total_input += t;
-                }
-                if let Some(t) = msg.get("outputTokens").and_then(|v| v.as_u64()) {
-                    total_output += t;
-                }
-            }
+            let total_input: u64 = history
+                .iter()
+                .filter_map(|m| m.get("inputTokens").and_then(|v| v.as_u64()))
+                .sum();
+            let total_output: u64 = history
+                .iter()
+                .filter_map(|m| m.get("outputTokens").and_then(|v| v.as_u64()))
+                .sum();
             let total_tokens = total_input + total_output;
+
             format!(
                 "Session \"{session_key}\": {msg_count} messages, {total_tokens} tokens used ({total_input} input / {total_output} output)."
             )
@@ -394,7 +393,9 @@ impl ChatService for LiveChatService {
             .iter()
             .filter_map(|m| m.get("inputTokens").and_then(|v| v.as_u64()))
             .sum();
-        if total_input >= context_window * 95 / 100 {
+        let compact_threshold = (context_window * 95) / 100;
+
+        if total_input >= compact_threshold {
             let pre_compact_msg_count = history.len();
             let total_output: u64 = history
                 .iter()
@@ -612,6 +613,50 @@ impl ChatService for LiveChatService {
             };
             if let Err(e) = hooks.dispatch(&payload).await {
                 warn!(session = %session_key, error = %e, "BeforeCompaction hook failed");
+            }
+        }
+
+        // Run silent memory turn before summarization — saves important memories to disk.
+        if let Some(ref mm) = self.state.memory_manager {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let provider_for_memory = {
+                let reg = self.providers.read().await;
+                let session_model = self
+                    .session_metadata
+                    .get(&session_key)
+                    .await
+                    .and_then(|e| e.model.clone());
+                let history_model = history
+                    .iter()
+                    .rev()
+                    .find_map(|m| m.get("model").and_then(|v| v.as_str()).map(String::from));
+                let model_id = session_model.or(history_model);
+                if let Some(ref id) = model_id {
+                    reg.get(id)
+                } else {
+                    None
+                }
+                .or_else(|| reg.first())
+            };
+            if let Some(provider) = provider_for_memory {
+                match moltis_agents::silent_turn::run_silent_memory_turn(provider, &history, &cwd)
+                    .await
+                {
+                    Ok(paths) => {
+                        for path in &paths {
+                            if let Err(e) = mm.sync_path(path).await {
+                                warn!(path = %path.display(), error = %e, "compact: memory sync of written file failed");
+                            }
+                        }
+                        if !paths.is_empty() {
+                            info!(
+                                files = paths.len(),
+                                "compact: silent memory turn wrote files"
+                            );
+                        }
+                    },
+                    Err(e) => warn!(error = %e, "compact: silent memory turn failed"),
+                }
             }
         }
 
@@ -837,16 +882,14 @@ impl ChatService for LiveChatService {
             .read(&session_key)
             .await
             .unwrap_or_default();
-        let mut total_input: u64 = 0;
-        let mut total_output: u64 = 0;
-        for msg in &messages {
-            if let Some(t) = msg.get("inputTokens").and_then(|v| v.as_u64()) {
-                total_input += t;
-            }
-            if let Some(t) = msg.get("outputTokens").and_then(|v| v.as_u64()) {
-                total_output += t;
-            }
-        }
+        let total_input: u64 = messages
+            .iter()
+            .filter_map(|m| m.get("inputTokens").and_then(|v| v.as_u64()))
+            .sum();
+        let total_output: u64 = messages
+            .iter()
+            .filter_map(|m| m.get("outputTokens").and_then(|v| v.as_u64()))
+            .sum();
         let total_tokens = total_input + total_output;
 
         // Context window from the session's provider

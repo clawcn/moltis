@@ -83,7 +83,7 @@ impl MemoryManager {
                 let path_str = path.to_string_lossy().to_string();
                 discovered_paths.push(path_str.clone());
 
-                match self.sync_file(path, &path_str).await {
+                match self.sync_file(path, &path_str, &mut report).await {
                     Ok(changed) => {
                         if changed {
                             report.files_updated += 1;
@@ -110,11 +110,36 @@ impl MemoryManager {
             }
         }
 
+        // LRU eviction on embedding cache
+        let cache_count = self.store.count_cached_embeddings().await.unwrap_or(0);
+        if cache_count > CACHE_MAX_ROWS {
+            let evicted = self
+                .store
+                .evict_embedding_cache(CACHE_MAX_ROWS)
+                .await
+                .unwrap_or(0);
+            if evicted > 0 {
+                info!(evicted, "embedding cache: evicted old entries");
+            }
+        }
+
         Ok(report)
     }
 
-    /// Sync a single file. Returns true if it was updated.
-    async fn sync_file(&self, path: &Path, path_str: &str) -> anyhow::Result<bool> {
+    /// Sync a single file by path. Returns true if it was updated.
+    pub async fn sync_path(&self, path: &Path) -> anyhow::Result<bool> {
+        let path_str = path.to_string_lossy().to_string();
+        let mut report = SyncReport::default();
+        self.sync_file(path, &path_str, &mut report).await
+    }
+
+    /// Sync a single file. Returns true if it was updated. Accumulates cache stats in `report`.
+    async fn sync_file(
+        &self,
+        path: &Path,
+        path_str: &str,
+        report: &mut SyncReport,
+    ) -> anyhow::Result<bool> {
         let content = tokio::fs::read_to_string(path).await?;
         let hash = sha256_hex(&content);
         let metadata = tokio::fs::metadata(path).await?;
@@ -158,9 +183,58 @@ impl MemoryManager {
 
         // Generate embeddings (if provider available) and create chunk rows.
         let texts: Vec<String> = raw_chunks.iter().map(|c| c.text.clone()).collect();
+        let chunk_hashes: Vec<String> = texts.iter().map(|t| sha256_hex(t)).collect();
+
         let (embeddings, model_name) = if let Some(ref embedder) = self.embedder {
-            let embs = embedder.embed_batch(&texts).await?;
-            (Some(embs), embedder.model_name().to_string())
+            let provider_key = embedder.provider_key();
+            let model = embedder.model_name();
+
+            // Check cache for each chunk
+            let mut cached: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+            for h in &chunk_hashes {
+                let hit = self
+                    .store
+                    .get_cached_embedding(provider_key, model, h)
+                    .await?;
+                cached.push(hit);
+            }
+
+            // Collect indices of cache misses
+            let miss_indices: Vec<usize> = cached
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_none())
+                .map(|(i, _)| i)
+                .collect();
+
+            report.cache_hits += texts.len() - miss_indices.len();
+            report.cache_misses += miss_indices.len();
+
+            // Build embedding vec: cached hits + placeholder for misses
+            let mut all_embeddings: Vec<Vec<f32>> =
+                cached.into_iter().map(|c| c.unwrap_or_default()).collect();
+
+            // Embed cache misses and store them
+            if !miss_indices.is_empty() {
+                let miss_texts: Vec<String> =
+                    miss_indices.iter().map(|&i| texts[i].clone()).collect();
+                let new_embs = embedder.embed_batch(&miss_texts).await?;
+
+                for (idx, emb) in miss_indices.iter().zip(new_embs.into_iter()) {
+                    self.store
+                        .put_cached_embedding(
+                            provider_key,
+                            model,
+                            provider_key,
+                            &chunk_hashes[*idx],
+                            &emb,
+                        )
+                        .await?;
+                    all_embeddings[*idx] = emb;
+                }
+            }
+
+            (Some(all_embeddings), model.to_string())
         } else {
             (None, String::new())
         };
@@ -169,7 +243,6 @@ impl MemoryManager {
             .iter()
             .enumerate()
             .map(|(i, chunk)| {
-                let chunk_hash = sha256_hex(&chunk.text);
                 let emb_blob = embeddings.as_ref().map(|embs| {
                     embs[i]
                         .iter()
@@ -182,7 +255,7 @@ impl MemoryManager {
                     source: source.to_string(),
                     start_line: chunk.start_line as i64,
                     end_line: chunk.end_line as i64,
-                    hash: chunk_hash,
+                    hash: chunk_hashes[i].clone(),
                     model: model_name.clone(),
                     text: chunk.text.clone(),
                     embedding: emb_blob,
@@ -247,7 +320,12 @@ pub struct SyncReport {
     pub files_unchanged: usize,
     pub files_removed: usize,
     pub errors: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
 }
+
+/// Maximum number of embedding cache rows before LRU eviction kicks in.
+const CACHE_MAX_ROWS: usize = 50_000;
 
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
@@ -311,6 +389,10 @@ mod tests {
         fn dimensions(&self) -> usize {
             8
         }
+
+        fn provider_key(&self) -> &str {
+            "mock"
+        }
     }
 
     async fn setup() -> (MemoryManager, TempDir) {
@@ -328,6 +410,7 @@ mod tests {
             chunk_overlap: 10,
             vector_weight: 0.7,
             keyword_weight: 0.3,
+            ..Default::default()
         };
 
         let store = Box::new(SqliteMemoryStore::new(pool));
@@ -592,6 +675,130 @@ mod tests {
             "keyword-only search should find results"
         );
         assert!(results[0].text.contains("programming"));
+    }
+
+    /// Mock embedder that counts how many texts it has been asked to embed.
+    struct CountingEmbedder {
+        embed_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn new() -> Self {
+            Self {
+                embed_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.embed_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for CountingEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.embed_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(keyword_embedding(text))
+        }
+
+        fn model_name(&self) -> &str {
+            "mock-model"
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn provider_key(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embedding_cache_hits() {
+        let tmp = TempDir::new().unwrap();
+        let mem_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        let config = MemoryConfig {
+            db_path: ":memory:".into(),
+            memory_dirs: vec![mem_dir.clone()],
+            chunk_size: 50,
+            chunk_overlap: 10,
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
+            ..Default::default()
+        };
+
+        let embedder = std::sync::Arc::new(CountingEmbedder::new());
+        let embedder_ref = std::sync::Arc::clone(&embedder);
+
+        // Wrap in a forwarding provider that delegates to the Arc'd one.
+        struct ArcEmbedder(std::sync::Arc<CountingEmbedder>);
+
+        #[async_trait]
+        impl EmbeddingProvider for ArcEmbedder {
+            async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+                self.0.embed(text).await
+            }
+
+            fn model_name(&self) -> &str {
+                self.0.model_name()
+            }
+
+            fn dimensions(&self) -> usize {
+                self.0.dimensions()
+            }
+
+            fn provider_key(&self) -> &str {
+                self.0.provider_key()
+            }
+        }
+
+        let store = Box::new(SqliteMemoryStore::new(pool));
+        let manager = MemoryManager::new(config, store, Box::new(ArcEmbedder(embedder)));
+
+        // Write a file and sync
+        std::fs::write(
+            mem_dir.join("test.md"),
+            "Rust programming with database and memory search features.",
+        )
+        .unwrap();
+
+        let r1 = manager.sync().await.unwrap();
+        assert_eq!(r1.files_updated, 1);
+        assert!(r1.cache_misses > 0);
+        assert_eq!(r1.cache_hits, 0);
+        let first_embed_count = embedder_ref.count();
+        assert!(first_embed_count > 0);
+
+        // Modify the file so it gets re-chunked, but same text content -> cache hits
+        // Actually, we need to change the file hash to trigger re-sync.
+        // Instead, delete the file record but keep the cache, then re-sync.
+        // Simplest: write a second file with same chunk text won't work.
+        // Best approach: delete file from store and re-sync.
+        // Actually the easiest way: write same content but change the file hash
+        // by adding a trailing newline.
+        std::fs::write(
+            mem_dir.join("test.md"),
+            "Rust programming with database and memory search features.\n",
+        )
+        .unwrap();
+
+        let r2 = manager.sync().await.unwrap();
+        assert_eq!(r2.files_updated, 1);
+        // The chunk text is the same, so we should get cache hits
+        assert!(r2.cache_hits > 0, "second sync should have cache hits");
+        // No new embeddings should have been generated
+        assert_eq!(
+            embedder_ref.count(),
+            first_embed_count,
+            "no new embed calls expected on cache hit"
+        );
     }
 
     #[test]

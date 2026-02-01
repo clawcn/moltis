@@ -67,10 +67,12 @@ impl HookDiscoverer for FsHookDiscoverer {
                 if !hook_dir.is_dir() {
                     continue;
                 }
+
                 let hook_md = hook_dir.join("HOOK.md");
                 if !hook_md.is_file() {
                     continue;
                 }
+
                 let content = match std::fs::read_to_string(&hook_md) {
                     Ok(c) => c,
                     Err(e) => {
@@ -78,13 +80,10 @@ impl HookDiscoverer for FsHookDiscoverer {
                         continue;
                     },
                 };
+
                 match parse_hook_md(&content, &hook_dir) {
-                    Ok(parsed) => {
-                        hooks.push((parsed, source.clone()));
-                    },
-                    Err(e) => {
-                        warn!(?hook_dir, %e, "failed to parse HOOK.md");
-                    },
+                    Ok(parsed) => hooks.push((parsed, source.clone())),
+                    Err(e) => warn!(?hook_dir, %e, "failed to parse HOOK.md"),
                 }
             }
         }

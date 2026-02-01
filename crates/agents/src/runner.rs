@@ -84,16 +84,16 @@ fn parse_tool_call_from_text(text: &str) -> Option<(ToolCall, Option<String>)> {
     // Collect any text outside the tool_call block.
     let before = text[..start].trim();
     let after_end = after_marker + end + 3; // skip closing ```
-    let after = if after_end < text.len() {
-        text[after_end..].trim()
+    let after = text.get(after_end..).unwrap_or("").trim();
+
+    let remaining = if before.is_empty() && after.is_empty() {
+        None
+    } else if before.is_empty() {
+        Some(after.to_string())
+    } else if after.is_empty() {
+        Some(before.to_string())
     } else {
-        ""
-    };
-    let remaining = match (before.is_empty(), after.is_empty()) {
-        (true, true) => None,
-        (false, true) => Some(before.to_string()),
-        (true, false) => Some(after.to_string()),
-        (false, false) => Some(format!("{before}\n{after}")),
+        Some(format!("{before}\n{after}"))
     };
 
     Some((

@@ -91,50 +91,50 @@ pub async fn handle_hooks(action: HookAction) -> anyhow::Result<()> {
         HookAction::Info { name } => {
             let found = hooks.iter().find(|(p, _)| p.metadata.name == name);
 
-            match found {
-                Some((parsed, source)) => {
-                    let meta = &parsed.metadata;
-                    let elig = check_hook_eligibility(meta);
-                    println!("Name:        {}", meta.name);
-                    println!("Description: {}", meta.description);
-                    if let Some(ref emoji) = meta.emoji {
-                        println!("Emoji:       {emoji}");
-                    }
-                    println!(
-                        "Events:      {}",
-                        meta.events
-                            .iter()
-                            .map(|e: &moltis_common::hooks::HookEvent| e.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    if let Some(ref cmd) = meta.command {
-                        println!("Command:     {cmd}");
-                    }
-                    println!("Priority:    {}", meta.priority);
-                    println!("Timeout:     {}s", meta.timeout);
-                    println!("Source:      {source:?}");
-                    println!("Path:        {}", parsed.source_path.display());
-                    println!("Eligible:    {}", elig.eligible);
-                    if !elig.eligible {
-                        if elig.missing_os {
-                            println!("  Missing OS: {:?}", meta.requires.os);
-                        }
-                        if !elig.missing_bins.is_empty() {
-                            println!("  Missing bins: {:?}", elig.missing_bins);
-                        }
-                        if !elig.missing_env.is_empty() {
-                            println!("  Missing env: {:?}", elig.missing_env);
-                        }
-                    }
-                    if !parsed.body.is_empty() {
-                        println!("\n{}", parsed.body);
-                    }
-                },
-                None => {
-                    eprintln!("Hook '{name}' not found.");
-                    std::process::exit(1);
-                },
+            let Some((parsed, source)) = found else {
+                eprintln!("Hook '{name}' not found.");
+                std::process::exit(1);
+            };
+
+            let meta = &parsed.metadata;
+            let elig = check_hook_eligibility(meta);
+
+            println!("Name:        {}", meta.name);
+            println!("Description: {}", meta.description);
+            if let Some(ref emoji) = meta.emoji {
+                println!("Emoji:       {emoji}");
+            }
+            println!(
+                "Events:      {}",
+                meta.events
+                    .iter()
+                    .map(|e: &moltis_common::hooks::HookEvent| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if let Some(ref cmd) = meta.command {
+                println!("Command:     {cmd}");
+            }
+            println!("Priority:    {}", meta.priority);
+            println!("Timeout:     {}s", meta.timeout);
+            println!("Source:      {source:?}");
+            println!("Path:        {}", parsed.source_path.display());
+            println!("Eligible:    {}", elig.eligible);
+
+            if !elig.eligible {
+                if elig.missing_os {
+                    println!("  Missing OS: {:?}", meta.requires.os);
+                }
+                if !elig.missing_bins.is_empty() {
+                    println!("  Missing bins: {:?}", elig.missing_bins);
+                }
+                if !elig.missing_env.is_empty() {
+                    println!("  Missing env: {:?}", elig.missing_env);
+                }
+            }
+
+            if !parsed.body.is_empty() {
+                println!("\n{}", parsed.body);
             }
         },
     }

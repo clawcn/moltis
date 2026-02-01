@@ -36,6 +36,24 @@ pub struct MoltisConfig {
     pub identity: AgentIdentity,
     pub user: UserProfile,
     pub hooks: Option<HooksConfig>,
+    pub memory: MemoryEmbeddingConfig,
+}
+
+/// Memory embedding provider configuration.
+///
+/// Controls which embedding provider the memory system uses.
+/// If not configured, the system auto-detects from available providers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryEmbeddingConfig {
+    /// Embedding provider: "local", "ollama", "openai", "custom", or None for auto-detect.
+    pub provider: Option<String>,
+    /// Base URL for the embedding API (e.g. "http://localhost:11434/v1" for Ollama).
+    pub base_url: Option<String>,
+    /// Model name (e.g. "nomic-embed-text" for Ollama, "text-embedding-3-small" for OpenAI).
+    pub model: Option<String>,
+    /// API key (optional for local endpoints like Ollama).
+    pub api_key: Option<String>,
 }
 
 /// Hooks configuration section (shell hooks defined in config file).

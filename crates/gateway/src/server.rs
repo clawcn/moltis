@@ -13,7 +13,7 @@ use {
         routing::get,
     },
     tower_http::cors::{Any, CorsLayer},
-    tracing::info,
+    tracing::{info, warn},
 };
 
 #[cfg(feature = "web-ui")]
@@ -503,10 +503,97 @@ pub async fn start_gateway(
 
     // ── Memory system initialization ─────────────────────────────────────
     let memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>> = {
-        // Providers that support the OpenAI-compatible /v1/embeddings endpoint.
-        // Ordered by preference: providers most likely to have good embeddings first.
+        // Build embedding provider(s) for the fallback chain.
+        let mut embedding_providers: Vec<(
+            String,
+            Box<dyn moltis_memory::embeddings::EmbeddingProvider>,
+        )> = Vec::new();
+
+        let mem_cfg = &config.memory;
+
+        // 1. If user explicitly configured an embedding provider, use it.
+        if let Some(ref provider_name) = mem_cfg.provider {
+            match provider_name.as_str() {
+                "local" => {
+                    // Local GGUF embeddings require the `local-embeddings` feature on moltis-memory.
+                    #[cfg(feature = "local-embeddings")]
+                    {
+                        let cache_dir = mem_cfg
+                            .base_url
+                            .as_ref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(
+                                moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::default_cache_dir,
+                            );
+                        match moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::ensure_model(
+                            cache_dir,
+                        )
+                        .await
+                        {
+                            Ok(path) => {
+                                match moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::new(
+                                    path,
+                                ) {
+                                    Ok(p) => embedding_providers.push(("local-gguf".into(), Box::new(p))),
+                                    Err(e) => warn!("memory: failed to load local GGUF model: {e}"),
+                                }
+                            },
+                            Err(e) => warn!("memory: failed to ensure local model: {e}"),
+                        }
+                    }
+                    #[cfg(not(feature = "local-embeddings"))]
+                    warn!(
+                        "memory: 'local' embedding provider requires the 'local-embeddings' feature"
+                    );
+                },
+                "ollama" | "custom" | "openai" => {
+                    let base_url = mem_cfg
+                        .base_url
+                        .clone()
+                        .unwrap_or_else(|| match provider_name.as_str() {
+                            "ollama" => "http://localhost:11434".into(),
+                            _ => "https://api.openai.com".into(),
+                        });
+                    let api_key = mem_cfg
+                        .api_key
+                        .clone()
+                        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                        .unwrap_or_default();
+                    let mut e =
+                        moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(api_key);
+                    if base_url != "https://api.openai.com" {
+                        e = e.with_base_url(base_url);
+                    }
+                    if let Some(ref model) = mem_cfg.model {
+                        // Use a sensible default dims; the API returns the actual dims.
+                        e = e.with_model(model.clone(), 1536);
+                    }
+                    embedding_providers.push((provider_name.clone(), Box::new(e)));
+                },
+                other => warn!("memory: unknown embedding provider '{other}'"),
+            }
+        }
+
+        // 2. Auto-detect: try Ollama health check.
+        if embedding_providers.is_empty() {
+            let ollama_ok = reqwest::Client::new()
+                .get("http://localhost:11434/api/tags")
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .is_ok();
+            if ollama_ok {
+                let e =
+                    moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(String::new())
+                        .with_base_url("http://localhost:11434".into())
+                        .with_model("nomic-embed-text".into(), 768);
+                embedding_providers.push(("ollama".into(), Box::new(e)));
+                info!("memory: detected Ollama at localhost:11434");
+            }
+        }
+
+        // 3. Auto-detect: try remote API-key providers.
         const EMBEDDING_CANDIDATES: &[(&str, &str, &str)] = &[
-            // (config_name, env_key, default_base_url)
             ("openai", "OPENAI_API_KEY", "https://api.openai.com"),
             ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
             (
@@ -521,42 +608,50 @@ pub async fn start_gateway(
             ("minimax", "MINIMAX_API_KEY", "https://api.minimax.chat/v1"),
             ("moonshot", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1"),
             ("venice", "VENICE_API_KEY", "https://api.venice.ai/api/v1"),
-            ("ollama", "OLLAMA_API_KEY", "http://localhost:11434"),
         ];
 
-        // Find the first provider that has an API key available.
-        let embedding_creds: Option<(String, String)> =
-            EMBEDDING_CANDIDATES
-                .iter()
-                .find_map(|(config_name, env_key, default_base)| {
-                    let key = effective_providers
-                        .get(config_name)
-                        .and_then(|e| e.api_key.clone())
-                        .or_else(|| std::env::var(env_key).ok())
-                        .filter(|k| !k.is_empty())?;
-
-                    let base = effective_providers
-                        .get(config_name)
-                        .and_then(|e| e.base_url.clone())
-                        .unwrap_or_else(|| default_base.to_string());
-
-                    Some((key, base))
-                });
-
-        // Build optional embedding provider from the first available API-key provider.
-        let embedder: Option<Box<moltis_memory::embeddings_openai::OpenAiEmbeddingProvider>> =
-            embedding_creds.map(|(api_key, base_url)| {
+        for (config_name, env_key, default_base) in EMBEDDING_CANDIDATES {
+            let key = effective_providers
+                .get(config_name)
+                .and_then(|e| e.api_key.clone())
+                .or_else(|| std::env::var(env_key).ok())
+                .filter(|k| !k.is_empty());
+            if let Some(api_key) = key {
+                let base = effective_providers
+                    .get(config_name)
+                    .and_then(|e| e.base_url.clone())
+                    .unwrap_or_else(|| default_base.to_string());
                 let mut e = moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(api_key);
-                if base_url != "https://api.openai.com" {
-                    e = e.with_base_url(base_url.clone());
+                if base != "https://api.openai.com" {
+                    e = e.with_base_url(base);
                 }
-                info!(base_url = %base_url, "memory: using embedding provider");
-                Box::new(e)
-            });
-
-        if embedder.is_none() {
-            info!("memory: no embedding provider found, using keyword-only search");
+                embedding_providers.push((config_name.to_string(), Box::new(e)));
+            }
         }
+
+        // Build the final embedder: fallback chain, single provider, or keyword-only.
+        let embedder: Option<Box<dyn moltis_memory::embeddings::EmbeddingProvider>> =
+            if embedding_providers.is_empty() {
+                info!("memory: no embedding provider found, using keyword-only search");
+                None
+            } else {
+                let names: Vec<&str> = embedding_providers
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                if embedding_providers.len() == 1 {
+                    let (name, provider) = embedding_providers.into_iter().next().unwrap();
+                    info!(provider = %name, "memory: using single embedding provider");
+                    Some(provider)
+                } else {
+                    info!(providers = ?names, active = names[0], "memory: fallback chain configured");
+                    Some(Box::new(
+                        moltis_memory::embeddings_fallback::FallbackEmbeddingProvider::new(
+                            embedding_providers,
+                        ),
+                    ))
+                }
+            };
 
         let memory_db_path = data_dir.join("memory.db");
         let memory_db_url = format!("sqlite:{}?mode=rwc", memory_db_path.display());
@@ -581,13 +676,14 @@ pub async fn start_gateway(
                     let store = Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(
                         memory_pool,
                     ));
+                    let watch_dirs = config.memory_dirs.clone();
                     let manager = Arc::new(if let Some(embedder) = embedder {
                         moltis_memory::manager::MemoryManager::new(config, store, embedder)
                     } else {
                         moltis_memory::manager::MemoryManager::keyword_only(config, store)
                     });
 
-                    // Initial sync + periodic re-sync every 5 minutes.
+                    // Initial sync + periodic re-sync (15min with watcher, 5min without).
                     let sync_manager = Arc::clone(&manager);
                     tokio::spawn(async move {
                         match sync_manager.sync().await {
@@ -596,12 +692,66 @@ pub async fn start_gateway(
                                 unchanged = report.files_unchanged,
                                 removed = report.files_removed,
                                 errors = report.errors,
+                                cache_hits = report.cache_hits,
+                                cache_misses = report.cache_misses,
                                 "memory: initial sync complete"
                             ),
                             Err(e) => tracing::warn!("memory: initial sync failed: {e}"),
                         }
+
+                        // Start file watcher for real-time sync (if feature enabled).
+                        #[cfg(feature = "file-watcher")]
+                        {
+                            let watcher_manager = Arc::clone(&sync_manager);
+                            match moltis_memory::watcher::MemoryFileWatcher::start(watch_dirs) {
+                                Ok((_watcher, mut rx)) => {
+                                    info!("memory: file watcher started");
+                                    tokio::spawn(async move {
+                                        while let Some(event) = rx.recv().await {
+                                            let path = match &event {
+                                                moltis_memory::watcher::WatchEvent::Created(p)
+                                                | moltis_memory::watcher::WatchEvent::Modified(p) => {
+                                                    Some(p.clone())
+                                                },
+                                                moltis_memory::watcher::WatchEvent::Removed(p) => {
+                                                    // For removed files, trigger a full sync
+                                                    if let Err(e) = watcher_manager.sync().await {
+                                                        tracing::warn!(
+                                                            path = %p.display(),
+                                                            error = %e,
+                                                            "memory: watcher sync (removal) failed"
+                                                        );
+                                                    }
+                                                    None
+                                                },
+                                            };
+                                            if let Some(path) = path
+                                                && let Err(e) =
+                                                    watcher_manager.sync_path(&path).await
+                                            {
+                                                tracing::warn!(
+                                                    path = %path.display(),
+                                                    error = %e,
+                                                    "memory: watcher sync_path failed"
+                                                );
+                                            }
+                                        }
+                                    });
+                                },
+                                Err(e) => {
+                                    tracing::warn!("memory: failed to start file watcher: {e}");
+                                },
+                            }
+                        }
+
+                        // Periodic full sync as safety net (longer interval with watcher).
+                        #[cfg(feature = "file-watcher")]
+                        let interval_secs = 900; // 15 minutes
+                        #[cfg(not(feature = "file-watcher"))]
+                        let interval_secs = 300; // 5 minutes
+
                         let mut interval =
-                            tokio::time::interval(std::time::Duration::from_secs(300));
+                            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                         interval.tick().await; // skip first immediate tick
                         loop {
                             interval.tick().await;

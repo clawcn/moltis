@@ -218,10 +218,9 @@ pub trait HookHandler: Send + Sync {
     /// Default implementation blocks on the async `handle`.
     fn handle_sync(&self, event: HookEvent, payload: &HookPayload) -> Result<HookAction> {
         // Default: spawn a blocking task. Native hooks can override for zero-overhead.
-        let rt = tokio::runtime::Handle::try_current();
-        match rt {
+        match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                // We're inside a tokio runtime — use block_in_place to avoid nested runtime panic.
+                // Inside a tokio runtime — use block_in_place to avoid nested runtime panic.
                 tokio::task::block_in_place(|| handle.block_on(self.handle(event, payload)))
             },
             Err(_) => {
@@ -382,9 +381,8 @@ impl HookRegistry {
     fn check_circuit_breaker(&self, entry: &HandlerEntry) -> bool {
         if !entry.stats.disabled.load(Ordering::Relaxed) {
             // Check if we should trip the breaker.
-            if entry.stats.consecutive_failures.load(Ordering::Relaxed)
-                >= self.circuit_breaker_threshold
-            {
+            let consecutive_failures = entry.stats.consecutive_failures.load(Ordering::Relaxed);
+            if consecutive_failures >= self.circuit_breaker_threshold {
                 entry.stats.disabled.store(true, Ordering::Relaxed);
                 *entry.stats.disabled_at.lock().unwrap() = Some(Instant::now());
                 warn!(
@@ -532,10 +530,10 @@ impl HookRegistry {
             }
         }
 
-        Ok(match last_modify {
-            Some(v) => HookAction::ModifyPayload(v),
-            None => HookAction::Continue,
-        })
+        match last_modify {
+            Some(v) => Ok(HookAction::ModifyPayload(v)),
+            None => Ok(HookAction::Continue),
+        }
     }
 
     /// Synchronous dispatch for hot-path events like `ToolResultPersist`.
@@ -588,10 +586,10 @@ impl HookRegistry {
             }
         }
 
-        Ok(match last_modify {
-            Some(v) => HookAction::ModifyPayload(v),
-            None => HookAction::Continue,
-        })
+        match last_modify {
+            Some(v) => Ok(HookAction::ModifyPayload(v)),
+            None => Ok(HookAction::Continue),
+        }
     }
 }
 
