@@ -71,6 +71,11 @@ What you get out of the box:
 - **OAuth flows** — built-in OAuth2 for provider authentication
 - **TLS support** — automatic self-signed certificate generation
 - **Observability** — OpenTelemetry tracing with OTLP export
+- **MCP (Model Context Protocol) support** — connect to MCP tool servers over
+  stdio or HTTP/SSE (remote servers), with health polling, automatic restart
+  on crash (exponential backoff), and in-UI server config editing
+- **Parallel tool execution** — when the LLM requests multiple tool calls in
+  one turn, they run concurrently via `futures::join_all`, reducing latency
 - **Sandboxed execution** — Docker and Apple Container backends with pre-built
   images, configurable packages, and per-session isolation
 - **Authentication** — password and passkey (WebAuthn) authentication with
@@ -83,6 +88,9 @@ What you get out of the box:
   defaults so you can edit packages and settings without recompiling
 - **Configurable directories** — `--config-dir` / `--data-dir` CLI flags and
   `MOLTIS_CONFIG_DIR` / `MOLTIS_DATA_DIR` environment variables
+- **Tailscale integration** — expose the gateway over your tailnet via Tailscale
+  Serve (private HTTPS) or Funnel (public HTTPS), with status monitoring and
+  mode switching from the web UI (optional `tailscale` feature flag)
 
 ## Quickstart
 
@@ -381,6 +389,7 @@ Moltis is organized as a Cargo workspace with the following crates:
 | `moltis-sessions` | Session persistence |
 | `moltis-memory` | Embeddings-based knowledge base |
 | `moltis-skills` | Skill/plugin system |
+| `moltis-mcp` | MCP client, transport, and tool bridge |
 | `moltis-plugins` | Plugin formats, hook handlers, and shell hook runtime |
 | `moltis-tools` | Tool/function execution |
 | `moltis-routing` | Message routing |

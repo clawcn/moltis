@@ -1,7 +1,7 @@
 use std::{fmt::Write, sync::Arc};
 
 use {
-    anyhow::Result,
+    anyhow::{Result, bail},
     tracing::{debug, info, trace, warn},
 };
 
@@ -28,25 +28,21 @@ const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
     "request_too_large",
 ];
 
-/// Typed error returned by the agent loop.
+/// Check if an error message indicates a context window overflow.
+fn is_context_window_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    CONTEXT_WINDOW_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Typed errors from the agent loop.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRunError {
-    /// The provider reported that the context window was exceeded.
+    /// The provider reported that the context window / token limit was exceeded.
     #[error("context window exceeded: {0}")]
     ContextWindowExceeded(String),
     /// Any other error.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
-}
-
-/// Check whether an error message indicates a context-window overflow.
-fn is_context_window_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    CONTEXT_WINDOW_PATTERNS
-        .iter()
-        .any(|pattern| lower.contains(pattern))
-        || lower.contains("status 413")
-        || lower.contains("http 413")
 }
 
 /// Result of running the agent loop.
@@ -84,13 +80,11 @@ pub enum RunnerEvent {
     ThinkingText(String),
     TextDelta(String),
     Iteration(usize),
-    /// A sub-agent has started executing.
     SubAgentStart {
         task: String,
         model: String,
         depth: u64,
     },
-    /// A sub-agent has finished executing.
     SubAgentEnd {
         task: String,
         model: String,
@@ -156,9 +150,11 @@ fn parse_tool_call_from_text(text: &str) -> Option<(ToolCall, Option<String>)> {
 
 // ── Tool result sanitization ────────────────────────────────────────────
 
+/// Tag that starts a base64 data URI.
 const BASE64_TAG: &str = "data:";
+/// Marker between MIME type and base64 payload.
 const BASE64_MARKER: &str = ";base64,";
-/// Minimum length of a blob (base64 payload or hex run) to be worth stripping.
+/// Minimum length of a blob payload (base64 or hex) to be worth stripping.
 const BLOB_MIN_LEN: usize = 200;
 
 fn is_base64_byte(b: u8) -> bool {
@@ -166,7 +162,7 @@ fn is_base64_byte(b: u8) -> bool {
 }
 
 /// Strip base64 data-URI blobs (e.g. `data:image/png;base64,AAAA...`) and
-/// replace them with a short placeholder. Only targets payloads >= 200 chars.
+/// replace them with a short placeholder. Only targets payloads ≥ 200 chars.
 fn strip_base64_blobs(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut rest = input;
@@ -177,10 +173,8 @@ fn strip_base64_blobs(input: &str) -> String {
 
         if let Some(marker_pos) = after_tag.find(BASE64_MARKER) {
             let payload_start = marker_pos + BASE64_MARKER.len();
-            let payload_len = after_tag[payload_start..]
-                .bytes()
-                .take_while(|b| is_base64_byte(*b))
-                .count();
+            let payload = &after_tag[payload_start..];
+            let payload_len = payload.bytes().take_while(|b| is_base64_byte(*b)).count();
 
             if payload_len >= BLOB_MIN_LEN {
                 let total_uri_len = BASE64_TAG.len() + payload_start + payload_len;
@@ -197,28 +191,31 @@ fn strip_base64_blobs(input: &str) -> String {
     result
 }
 
-/// Strip long hex sequences (>= 200 hex chars) that look like binary dumps.
+/// Strip long hex sequences (≥ 200 hex chars) that look like binary dumps.
 fn strip_hex_blobs(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
+    let mut chars = input.char_indices().peekable();
 
-    while i < bytes.len() {
-        if bytes[i].is_ascii_hexdigit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-                i += 1;
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_ascii_hexdigit() {
+            let mut end = start;
+            while let Some(&(i, c)) = chars.peek() {
+                if c.is_ascii_hexdigit() {
+                    end = i + c.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
             }
-            let run = i - start;
+            let run = end - start;
             if run >= BLOB_MIN_LEN {
                 write!(result, "[hex data removed — {run} chars]").unwrap();
             } else {
-                result.push_str(&input[start..i]);
+                result.push_str(&input[start..end]);
             }
         } else {
-            let ch = input[i..].chars().next().unwrap();
             result.push(ch);
-            i += ch.len_utf8();
+            chars.next();
         }
     }
     result
@@ -226,8 +223,8 @@ fn strip_hex_blobs(input: &str) -> String {
 
 /// Sanitize a tool result string before feeding it to the LLM.
 ///
-/// 1. Strips base64 data URIs (>= 200 char payloads).
-/// 2. Strips long hex sequences (>= 200 hex chars).
+/// 1. Strips base64 data URIs (≥ 200 char payloads).
+/// 2. Strips long hex sequences (≥ 200 hex chars).
 /// 3. Truncates the result to `max_bytes` (at a char boundary), appending a
 ///    truncation marker.
 pub fn sanitize_tool_result(input: &str, max_bytes: usize) -> String {
@@ -286,10 +283,10 @@ pub async fn run_agent_loop_with_context(
     hook_registry: Option<Arc<HookRegistry>>,
 ) -> Result<AgentRunResult, AgentRunError> {
     let native_tools = provider.supports_tools();
-    let tool_schemas = tools.list_schemas();
     let max_tool_result_bytes = moltis_config::discover_and_load()
         .tools
         .max_tool_result_bytes;
+    let tool_schemas = tools.list_schemas();
 
     info!(
         provider = provider.name(),
@@ -298,32 +295,6 @@ pub async fn run_agent_loop_with_context(
         tools_count = tool_schemas.len(),
         "starting agent loop"
     );
-
-    // Extract session key early for hook payloads.
-    let session_key_for_hooks = tool_context
-        .as_ref()
-        .and_then(|ctx| ctx.get("_session_key"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    // Dispatch BeforeAgentStart hook — may block or modify model.
-    if let Some(ref hooks) = hook_registry {
-        let payload = HookPayload::BeforeAgentStart {
-            session_key: session_key_for_hooks.clone(),
-            model: provider.id().to_string(),
-        };
-        match hooks.dispatch(&payload).await {
-            Ok(HookAction::Block(reason)) => {
-                warn!(reason = %reason, "agent start blocked by hook");
-                return Err(anyhow::anyhow!("agent start blocked by hook: {reason}").into());
-            },
-            Ok(_) => {},
-            Err(e) => {
-                warn!(error = %e, "BeforeAgentStart hook dispatch failed");
-            },
-        }
-    }
 
     let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
@@ -356,7 +327,9 @@ pub async fn run_agent_loop_with_context(
         iterations += 1;
         if iterations > MAX_ITERATIONS {
             warn!("agent loop exceeded max iterations ({})", MAX_ITERATIONS);
-            return Err(anyhow::anyhow!("agent loop exceeded max iterations").into());
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent loop exceeded max iterations"
+            )));
         }
 
         if let Some(cb) = on_event {
@@ -374,57 +347,19 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        // Dispatch MessageSending hook — can modify the user content being sent.
-        if let Some(ref hooks) = hook_registry {
-            let last_user_content = messages
-                .iter()
-                .rev()
-                .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-                .and_then(|m| m.get("content").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string();
-            let payload = HookPayload::MessageSending {
-                session_key: session_key_for_hooks.clone(),
-                content: last_user_content,
-            };
-            match hooks.dispatch(&payload).await {
-                Ok(HookAction::Block(reason)) => {
-                    warn!(reason = %reason, "message sending blocked by hook");
-                    return Err(anyhow::anyhow!("message sending blocked by hook: {reason}").into());
-                },
-                Ok(_) => {},
-                Err(e) => {
-                    warn!(error = %e, "MessageSending hook dispatch failed");
-                },
-            }
-        }
-
-        let mut response: CompletionResponse =
-            match provider.complete(&messages, schemas_for_api).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if is_context_window_error(&msg) {
-                        return Err(AgentRunError::ContextWindowExceeded(msg));
-                    }
-                    return Err(AgentRunError::Other(e));
-                },
-            };
+        let mut response: CompletionResponse = provider
+            .complete(&messages, schemas_for_api)
+            .await
+            .map_err(|e| {
+                if is_context_window_error(&e.to_string()) {
+                    AgentRunError::ContextWindowExceeded(e.to_string())
+                } else {
+                    AgentRunError::Other(e)
+                }
+            })?;
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
-        }
-
-        // Dispatch MessageSent hook (read-only) with the LLM response.
-        if let Some(ref hooks) = hook_registry {
-            let content = response.text.clone().unwrap_or_default();
-            let payload = HookPayload::MessageSent {
-                session_key: session_key_for_hooks.clone(),
-                content,
-            };
-            if let Err(e) = hooks.dispatch(&payload).await {
-                warn!(error = %e, "MessageSent hook dispatch failed");
-            }
         }
 
         total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
@@ -474,20 +409,6 @@ pub async fn run_agent_loop_with_context(
                 tool_calls = total_tool_calls,
                 "agent loop complete — returning text"
             );
-
-            // Dispatch AgentEnd hook (read-only).
-            if let Some(ref hooks) = hook_registry {
-                let payload = HookPayload::AgentEnd {
-                    session_key: session_key_for_hooks.clone(),
-                    text: text.clone(),
-                    iterations,
-                    tool_calls: total_tool_calls,
-                };
-                if let Err(e) = hooks.dispatch(&payload).await {
-                    warn!(error = %e, "AgentEnd hook dispatch failed");
-                }
-            }
-
             return Ok(AgentRunResult {
                 text,
                 iterations,
@@ -527,10 +448,19 @@ pub async fn run_agent_loop_with_context(
         }
         messages.push(assistant_msg);
 
-        // Execute each tool call.
-        for tc in &response.tool_calls {
-            total_tool_calls += 1;
+        // Extract session key from tool_context for hook payloads.
+        let session_key = tool_context
+            .as_ref()
+            .and_then(|ctx| ctx.get("_session_key"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
+        // Execute tool calls concurrently.
+        total_tool_calls += response.tool_calls.len();
+
+        // Emit all ToolCallStart events first (preserves notification order).
+        for tc in &response.tool_calls {
             if let Some(cb) = on_event {
                 cb(RunnerEvent::ToolCallStart {
                     id: tc.id.clone(),
@@ -538,50 +468,23 @@ pub async fn run_agent_loop_with_context(
                     arguments: tc.arguments.clone(),
                 });
             }
+            info!(tool = %tc.name, id = %tc.id, args = %tc.arguments, "executing tool");
+        }
 
-            // Dispatch BeforeToolCall hook — may block or modify arguments.
-            let mut effective_args = tc.arguments.clone();
-            if let Some(ref hooks) = hook_registry {
-                let payload = HookPayload::BeforeToolCall {
-                    session_key: session_key_for_hooks.clone(),
-                    tool_name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                };
-                match hooks.dispatch(&payload).await {
-                    Ok(HookAction::Block(reason)) => {
-                        warn!(tool = %tc.name, reason = %reason, "tool call blocked by hook");
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::ToolCallEnd {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                success: false,
-                                error: Some(reason.clone()),
-                                result: None,
-                            });
-                        }
-                        let err_str = format!("blocked by hook: {reason}");
-                        messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": serde_json::json!({ "error": err_str }).to_string(),
-                        }));
-                        continue;
-                    },
-                    Ok(HookAction::ModifyPayload(v)) => {
-                        effective_args = v;
-                    },
-                    Ok(HookAction::Continue) => {},
-                    Err(e) => {
-                        warn!(tool = %tc.name, error = %e, "BeforeToolCall hook dispatch failed");
-                    },
-                }
-            }
+        // Build futures for all tool calls (executed concurrently).
+        let tool_futures: Vec<_> = response
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let tool = tools.get(&tc.name);
+                let mut args = tc.arguments.clone();
 
-            info!(tool = %tc.name, id = %tc.id, args = %effective_args, "executing tool");
+                // Dispatch BeforeToolCall hook — may block or modify arguments.
+                let hook_registry = hook_registry.clone();
+                let session_key = session_key.clone();
+                let tc_name = tc.name.clone();
+                let _tc_id = tc.id.clone();
 
-            let result = if let Some(tool) = tools.get(&tc.name) {
-                // Merge tool_context (e.g. _session_key) into the tool call params.
-                let mut args = effective_args;
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
                 {
@@ -589,97 +492,109 @@ pub async fn run_agent_loop_with_context(
                         args_obj.insert(k.clone(), v.clone());
                     }
                 }
-                match tool.execute(args).await {
-                    Ok(val) => {
-                        info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
-                        trace!(tool = %tc.name, result = %val, "tool result");
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::ToolCallEnd {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                success: true,
-                                error: None,
-                                result: Some(val.clone()),
-                            });
+                async move {
+                    // Run BeforeToolCall hook.
+                    if let Some(ref hooks) = hook_registry {
+                        let payload = HookPayload::BeforeToolCall {
+                            session_key: session_key.clone(),
+                            tool_name: tc_name.clone(),
+                            arguments: args.clone(),
+                        };
+                        match hooks.dispatch(&payload).await {
+                            Ok(HookAction::Block(reason)) => {
+                                warn!(tool = %tc_name, reason = %reason, "tool call blocked by hook");
+                                let err_str = format!("blocked by hook: {reason}");
+                                return (
+                                    false,
+                                    serde_json::json!({ "error": err_str }),
+                                    Some(err_str),
+                                );
+                            },
+                            Ok(HookAction::ModifyPayload(v)) => {
+                                args = v;
+                            },
+                            Ok(HookAction::Continue) => {},
+                            Err(e) => {
+                                warn!(tool = %tc_name, error = %e, "BeforeToolCall hook dispatch failed");
+                            },
                         }
-                        // Dispatch AfterToolCall hook.
-                        if let Some(ref hooks) = hook_registry {
-                            let payload = HookPayload::AfterToolCall {
-                                session_key: session_key_for_hooks.clone(),
-                                tool_name: tc.name.clone(),
-                                success: true,
-                                result: Some(val.clone()),
-                            };
-                            if let Err(e) = hooks.dispatch(&payload).await {
-                                warn!(tool = %tc.name, error = %e, "AfterToolCall hook dispatch failed");
-                            }
-                        }
-                        serde_json::json!({ "result": val })
-                    },
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        warn!(tool = %tc.name, id = %tc.id, error = %err_str, "tool execution failed");
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::ToolCallEnd {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                success: false,
-                                error: Some(err_str.clone()),
-                                result: None,
-                            });
-                        }
-                        // Dispatch AfterToolCall hook on failure too.
-                        if let Some(ref hooks) = hook_registry {
-                            let payload = HookPayload::AfterToolCall {
-                                session_key: session_key_for_hooks.clone(),
-                                tool_name: tc.name.clone(),
-                                success: false,
-                                result: None,
-                            };
-                            if let Err(e) = hooks.dispatch(&payload).await {
-                                warn!(tool = %tc.name, error = %e, "AfterToolCall hook dispatch failed");
-                            }
-                        }
-                        serde_json::json!({ "error": err_str })
-                    },
-                }
-            } else {
-                let err_str = format!("unknown tool: {}", tc.name);
-                warn!(tool = %tc.name, id = %tc.id, "unknown tool requested by LLM");
-                if let Some(cb) = on_event {
-                    cb(RunnerEvent::ToolCallEnd {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        success: false,
-                        error: Some(err_str.clone()),
-                        result: None,
-                    });
-                }
-                serde_json::json!({ "error": err_str })
-            };
+                    }
 
-            // Dispatch ToolResultPersist hook — can modify the result before it enters history.
-            let result = if let Some(ref hooks) = hook_registry {
-                let payload = HookPayload::ToolResultPersist {
-                    session_key: session_key_for_hooks.clone(),
-                    tool_name: tc.name.clone(),
-                    result: result.clone(),
-                };
-                match hooks.dispatch_sync(&payload) {
-                    Ok(HookAction::ModifyPayload(v)) => v,
-                    Ok(HookAction::Block(reason)) => {
-                        warn!(tool = %tc.name, reason = %reason, "tool result persist blocked by hook");
-                        serde_json::json!({ "error": format!("result blocked: {reason}") })
-                    },
-                    Ok(HookAction::Continue) => result,
-                    Err(e) => {
-                        warn!(tool = %tc.name, error = %e, "ToolResultPersist hook failed");
-                        result
-                    },
+                    if let Some(tool) = tool {
+                        match tool.execute(args).await {
+                            Ok(val) => {
+                                // Dispatch AfterToolCall hook on success.
+                                if let Some(ref hooks) = hook_registry {
+                                    let payload = HookPayload::AfterToolCall {
+                                        session_key: session_key.clone(),
+                                        tool_name: tc_name.clone(),
+                                        success: true,
+                                        result: Some(val.clone()),
+                                    };
+                                    if let Err(e) = hooks.dispatch(&payload).await {
+                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
+                                    }
+                                }
+                                (true, serde_json::json!({ "result": val }), None)
+                            },
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                // Dispatch AfterToolCall hook on failure.
+                                if let Some(ref hooks) = hook_registry {
+                                    let payload = HookPayload::AfterToolCall {
+                                        session_key: session_key.clone(),
+                                        tool_name: tc_name.clone(),
+                                        success: false,
+                                        result: None,
+                                    };
+                                    if let Err(e) = hooks.dispatch(&payload).await {
+                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
+                                    }
+                                }
+                                (
+                                    false,
+                                    serde_json::json!({ "error": err_str }),
+                                    Some(err_str),
+                                )
+                            },
+                        }
+                    } else {
+                        let err_str = format!("unknown tool: {tc_name}");
+                        (
+                            false,
+                            serde_json::json!({ "error": err_str }),
+                            Some(err_str),
+                        )
+                    }
                 }
+            })
+            .collect();
+
+        // Execute all tools concurrently and collect results in order.
+        let results = futures::future::join_all(tool_futures).await;
+
+        // Process results in original order: emit events, append messages.
+        for (tc, (success, result, error)) in response.tool_calls.iter().zip(results) {
+            if success {
+                info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
+                trace!(tool = %tc.name, result = %result, "tool result");
             } else {
-                result
-            };
+                warn!(tool = %tc.name, id = %tc.id, error = %error.as_deref().unwrap_or(""), "tool execution failed");
+            }
+
+            if let Some(cb) = on_event {
+                cb(RunnerEvent::ToolCallEnd {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    success,
+                    error,
+                    result: if success {
+                        result.get("result").cloned()
+                    } else {
+                        None
+                    },
+                });
+            }
 
             let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
             debug!(
@@ -701,9 +616,7 @@ pub async fn run_agent_loop_with_context(
 
 /// Convenience wrapper matching the old stub signature.
 pub async fn run_agent(_agent_id: &str, _session_key: &str, _message: &str) -> Result<String> {
-    anyhow::bail!(
-        "run_agent requires a configured provider and tool registry; use run_agent_loop instead"
-    )
+    bail!("run_agent requires a configured provider and tool registry; use run_agent_loop instead")
 }
 
 #[cfg(test)]
@@ -1173,309 +1086,74 @@ mod tests {
         );
     }
 
-    // ── Hook integration tests ──────────────────────────────────────
+    // ── Parallel tool execution tests ────────────────────────────────
 
-    use moltis_common::hooks::{HookAction, HookHandler, HookPayload, HookRegistry};
-
-    /// Hook that blocks BeforeAgentStart.
-    struct BlockAgentStartHook;
-
-    #[async_trait]
-    impl HookHandler for BlockAgentStartHook {
-        fn name(&self) -> &str {
-            "block-agent-start"
-        }
-
-        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
-            &[moltis_common::hooks::HookEvent::BeforeAgentStart]
-        }
-
-        async fn handle(
-            &self,
-            _event: moltis_common::hooks::HookEvent,
-            _payload: &HookPayload,
-        ) -> Result<HookAction> {
-            Ok(HookAction::Block("test block".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_before_agent_start_hook_blocks() {
-        let provider = Arc::new(MockProvider {
-            response_text: "Hello!".into(),
-        });
-        let tools = ToolRegistry::new();
-        let mut registry = HookRegistry::new();
-        registry.register(Arc::new(BlockAgentStartHook));
-
-        let result = run_agent_loop_with_context(
-            provider,
-            &tools,
-            "system",
-            "hi",
-            None,
-            None,
-            Some(serde_json::json!({"_session_key": "test"})),
-            Some(Arc::new(registry)),
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("agent start blocked by hook")
-        );
-    }
-
-    /// Hook that records AgentEnd events.
-    struct RecordAgentEndHook {
-        called: Arc<std::sync::atomic::AtomicBool>,
+    /// A tool that sleeps then returns its name.
+    struct SlowTool {
+        tool_name: String,
+        delay_ms: u64,
     }
 
     #[async_trait]
-    impl HookHandler for RecordAgentEndHook {
+    impl crate::tool_registry::AgentTool for SlowTool {
         fn name(&self) -> &str {
-            "record-agent-end"
+            &self.tool_name
         }
 
-        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
-            &[moltis_common::hooks::HookEvent::AgentEnd]
+        fn description(&self) -> &str {
+            "Slow tool for testing"
         }
 
-        async fn handle(
-            &self,
-            _event: moltis_common::hooks::HookEvent,
-            _payload: &HookPayload,
-        ) -> Result<HookAction> {
-            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(HookAction::Continue)
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(serde_json::json!({ "tool": self.tool_name }))
         }
     }
 
-    #[tokio::test]
-    async fn test_agent_end_hook_fires() {
-        let provider = Arc::new(MockProvider {
-            response_text: "Hello!".into(),
-        });
-        let tools = ToolRegistry::new();
-        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut registry = HookRegistry::new();
-        registry.register(Arc::new(RecordAgentEndHook {
-            called: Arc::clone(&called),
-        }));
-
-        let result = run_agent_loop_with_context(
-            provider,
-            &tools,
-            "system",
-            "hi",
-            None,
-            None,
-            Some(serde_json::json!({"_session_key": "test"})),
-            Some(Arc::new(registry)),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.text, "Hello!");
-        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    /// Hook that blocks MessageSending.
-    struct BlockMessageSendingHook;
+    /// A tool that always fails.
+    struct FailTool;
 
     #[async_trait]
-    impl HookHandler for BlockMessageSendingHook {
+    impl crate::tool_registry::AgentTool for FailTool {
         fn name(&self) -> &str {
-            "block-message-sending"
+            "fail_tool"
         }
 
-        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
-            &[moltis_common::hooks::HookEvent::MessageSending]
+        fn description(&self) -> &str {
+            "Always fails"
         }
 
-        async fn handle(
-            &self,
-            _event: moltis_common::hooks::HookEvent,
-            _payload: &HookPayload,
-        ) -> Result<HookAction> {
-            Ok(HookAction::Block("content policy violation".into()))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_message_sending_hook_blocks() {
-        let provider = Arc::new(MockProvider {
-            response_text: "Hello!".into(),
-        });
-        let tools = ToolRegistry::new();
-        let mut registry = HookRegistry::new();
-        registry.register(Arc::new(BlockMessageSendingHook));
-
-        let result = run_agent_loop_with_context(
-            provider,
-            &tools,
-            "system",
-            "hi",
-            None,
-            None,
-            Some(serde_json::json!({"_session_key": "test"})),
-            Some(Arc::new(registry)),
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("message sending blocked")
-        );
-    }
-
-    /// Hook that records MessageSent events.
-    struct RecordMessageSentHook {
-        content: Arc<std::sync::Mutex<String>>,
-    }
-
-    #[async_trait]
-    impl HookHandler for RecordMessageSentHook {
-        fn name(&self) -> &str {
-            "record-message-sent"
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
         }
 
-        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
-            &[moltis_common::hooks::HookEvent::MessageSent]
-        }
-
-        async fn handle(
-            &self,
-            _event: moltis_common::hooks::HookEvent,
-            payload: &HookPayload,
-        ) -> Result<HookAction> {
-            if let HookPayload::MessageSent { content, .. } = payload {
-                *self.content.lock().unwrap() = content.clone();
-            }
-            Ok(HookAction::Continue)
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            anyhow::bail!("intentional failure")
         }
     }
 
-    #[tokio::test]
-    async fn test_message_sent_hook_fires() {
-        let provider = Arc::new(MockProvider {
-            response_text: "Hello from LLM!".into(),
-        });
-        let tools = ToolRegistry::new();
-        let content = Arc::new(std::sync::Mutex::new(String::new()));
-        let mut registry = HookRegistry::new();
-        registry.register(Arc::new(RecordMessageSentHook {
-            content: Arc::clone(&content),
-        }));
-
-        let result = run_agent_loop_with_context(
-            provider,
-            &tools,
-            "system",
-            "hi",
-            None,
-            None,
-            Some(serde_json::json!({"_session_key": "test"})),
-            Some(Arc::new(registry)),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.text, "Hello from LLM!");
-        assert_eq!(*content.lock().unwrap(), "Hello from LLM!");
-    }
-
-    /// Hook that redacts tool results via ToolResultPersist.
-    struct RedactToolResultHook;
-
-    #[async_trait]
-    impl HookHandler for RedactToolResultHook {
-        fn name(&self) -> &str {
-            "redact-tool-result"
-        }
-
-        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
-            &[moltis_common::hooks::HookEvent::ToolResultPersist]
-        }
-
-        async fn handle(
-            &self,
-            _event: moltis_common::hooks::HookEvent,
-            _payload: &HookPayload,
-        ) -> Result<HookAction> {
-            Ok(HookAction::ModifyPayload(
-                serde_json::json!({"result": "[REDACTED]"}),
-            ))
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_tool_result_persist_hook_modifies() {
-        let provider = Arc::new(ToolCallingProvider {
-            call_count: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let mut tools = ToolRegistry::new();
-        tools.register(Box::new(EchoTool));
-
-        let mut registry = HookRegistry::new();
-        registry.register(Arc::new(RedactToolResultHook));
-
-        let result = run_agent_loop_with_context(
-            provider,
-            &tools,
-            "system",
-            "use tool",
-            None,
-            None,
-            Some(serde_json::json!({"_session_key": "test"})),
-            Some(Arc::new(registry)),
-        )
-        .await
-        .unwrap();
-
-        // The agent still completes — the redacted result is fed to the LLM.
-        assert_eq!(result.text, "Done!");
-        assert_eq!(result.tool_calls_made, 1);
-    }
-
-    // ── Context window error detection tests ───────────────────────
-
-    #[test]
-    fn test_is_context_window_error_patterns() {
-        assert!(is_context_window_error(
-            "context_length_exceeded: too many tokens"
-        ));
-        assert!(is_context_window_error("request too large for model"));
-        assert!(is_context_window_error(
-            "This model's maximum context length is 128000 tokens"
-        ));
-        assert!(is_context_window_error("HTTP 413 Payload Too Large"));
-        assert!(is_context_window_error("status 413"));
-        assert!(is_context_window_error("content_too_large"));
-        assert!(!is_context_window_error("rate limit exceeded"));
-        assert!(!is_context_window_error("internal server error"));
-    }
-
-    /// Mock provider that returns a context-window error on the first call,
-    /// then succeeds on the second.
-    struct ContextWindowErrorProvider {
+    /// Mock provider returning N tool calls on the first call, then text.
+    struct MultiToolProvider {
         call_count: std::sync::atomic::AtomicUsize,
+        tool_calls: Vec<ToolCall>,
     }
 
     #[async_trait]
-    impl LlmProvider for ContextWindowErrorProvider {
+    impl LlmProvider for MultiToolProvider {
         fn name(&self) -> &str {
             "mock"
         }
 
         fn id(&self) -> &str {
             "mock-model"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
         }
 
         async fn complete(
@@ -1487,18 +1165,24 @@ mod tests {
                 .call_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count == 0 {
-                anyhow::bail!(
-                    "context_length_exceeded: This model's maximum context length is 128000 tokens"
-                );
+                Ok(CompletionResponse {
+                    text: None,
+                    tool_calls: self.tool_calls.clone(),
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                })
+            } else {
+                Ok(CompletionResponse {
+                    text: Some("All done".into()),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                })
             }
-            Ok(CompletionResponse {
-                text: Some("Success after retry".into()),
-                tool_calls: vec![],
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                },
-            })
         }
 
         fn stream(
@@ -1510,61 +1194,204 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_context_window_error_returned() {
-        let provider = Arc::new(ContextWindowErrorProvider {
+    async fn test_parallel_tool_execution() {
+        let provider = Arc::new(MultiToolProvider {
             call_count: std::sync::atomic::AtomicUsize::new(0),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "tool_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "tool_b".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "tool_c".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
         });
-        let tools = ToolRegistry::new();
-        let result =
-            run_agent_loop(provider, &tools, "You are a test bot.", "Hi", None, None).await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_a".into(),
+            delay_ms: 0,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_b".into(),
+            delay_ms: 0,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_c".into(),
+            delay_ms: 0,
+        }));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "Test bot",
+            "Use all tools",
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "All done");
+        assert_eq!(result.tool_calls_made, 3);
+
+        // Verify all 3 ToolCallStart events come before any ToolCallEnd events.
+        let evts = events.lock().unwrap();
+        let starts: Vec<_> = evts
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, RunnerEvent::ToolCallStart { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let ends: Vec<_> = evts
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, RunnerEvent::ToolCallEnd { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(ends.len(), 3);
         assert!(
-            matches!(err, AgentRunError::ContextWindowExceeded(_)),
-            "expected ContextWindowExceeded, got: {err:?}"
+            starts.iter().all(|s| ends.iter().all(|e| s < e)),
+            "all starts should precede all ends"
         );
     }
 
     #[tokio::test]
-    async fn test_non_context_error_is_other() {
-        struct FailProvider;
+    async fn test_parallel_tool_one_fails() {
+        let provider = Arc::new(MultiToolProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "tool_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "fail_tool".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "tool_c".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+        });
 
-        #[async_trait]
-        impl LlmProvider for FailProvider {
-            fn name(&self) -> &str {
-                "mock"
-            }
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_a".into(),
+            delay_ms: 0,
+        }));
+        tools.register(Box::new(FailTool));
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_c".into(),
+            delay_ms: 0,
+        }));
 
-            fn id(&self) -> &str {
-                "mock"
-            }
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
 
-            async fn complete(
-                &self,
-                _messages: &[serde_json::Value],
-                _tools: &[serde_json::Value],
-            ) -> Result<CompletionResponse> {
-                anyhow::bail!("internal server error")
-            }
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "Test bot",
+            "Use all tools",
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
 
-            fn stream(
-                &self,
-                _messages: Vec<serde_json::Value>,
-            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-                Box::pin(tokio_stream::empty())
-            }
-        }
+        assert_eq!(result.text, "All done");
+        assert_eq!(result.tool_calls_made, 3);
 
-        let provider = Arc::new(FailProvider);
-        let tools = ToolRegistry::new();
-        let result = run_agent_loop(provider, &tools, "system", "hi", None, None).await;
+        // Verify: 2 successes, 1 failure.
+        let evts = events.lock().unwrap();
+        let successes = evts
+            .iter()
+            .filter(|e| matches!(e, RunnerEvent::ToolCallEnd { success: true, .. }))
+            .count();
+        let failures = evts
+            .iter()
+            .filter(|e| matches!(e, RunnerEvent::ToolCallEnd { success: false, .. }))
+            .count();
+        assert_eq!(successes, 2);
+        assert_eq!(failures, 1);
+    }
 
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    #[tokio::test]
+    async fn test_parallel_execution_is_concurrent() {
+        let provider = Arc::new(MultiToolProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "slow_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "slow_b".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "slow_c".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            tool_name: "slow_a".into(),
+            delay_ms: 100,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "slow_b".into(),
+            delay_ms: 100,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "slow_c".into(),
+            delay_ms: 100,
+        }));
+
+        let start = std::time::Instant::now();
+        let result = run_agent_loop(provider, &tools, "Test bot", "Use all tools", None, None)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.text, "All done");
+        assert_eq!(result.tool_calls_made, 3);
+        // If sequential, would take ≥300ms. Parallel should be ~100ms.
         assert!(
-            matches!(err, AgentRunError::Other(_)),
-            "expected Other, got: {err:?}"
+            elapsed < std::time::Duration::from_millis(250),
+            "parallel execution took {:?}, expected < 250ms",
+            elapsed
         );
     }
 
@@ -1578,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_truncates_long_input() {
-        let input = "x".repeat(1000); // 'x' is not all-hex so hex stripper won't touch it
+        let input = "x".repeat(1000);
         let result = sanitize_tool_result(&input, 100);
         assert!(result.starts_with("xxxx"));
         assert!(result.contains("[truncated"));
@@ -1587,14 +1414,12 @@ mod tests {
 
     #[test]
     fn test_sanitize_truncate_respects_char_boundary() {
-        // 'é' is 2 bytes in UTF-8. Fill with 'é' so max_bytes falls mid-char.
         let input = "é".repeat(100); // 200 bytes
-        let result = sanitize_tool_result(&input, 51); // 51 is mid-char
+        let result = sanitize_tool_result(&input, 51); // mid-char
         assert!(result.contains("[truncated"));
-        // Prefix must be valid UTF-8 (it is, since we got a String back).
         let prefix_end = result.find("\n\n[truncated").unwrap();
         assert!(prefix_end <= 51);
-        assert_eq!(prefix_end % 2, 0); // each 'é' is 2 bytes
+        assert_eq!(prefix_end % 2, 0);
     }
 
     #[test]
@@ -1610,7 +1435,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_preserves_short_base64() {
-        let payload = "QUFB"; // 4 chars, below threshold
+        let payload = "QUFB";
         let input = format!("data:text/plain;base64,{payload}");
         let result = sanitize_tool_result(&input, 50_000);
         assert!(result.contains(payload));
@@ -1629,7 +1454,7 @@ mod tests {
 
     #[test]
     fn test_sanitize_preserves_short_hex() {
-        let hex = "deadbeef"; // 8 chars, below threshold
+        let hex = "deadbeef";
         let input = format!("code: {hex}");
         let result = sanitize_tool_result(&input, 50_000);
         assert!(result.contains(hex));

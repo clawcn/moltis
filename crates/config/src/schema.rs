@@ -73,6 +73,7 @@ pub struct MoltisConfig {
     pub chat: ChatConfig,
     pub tools: ToolsConfig,
     pub skills: SkillsConfig,
+    pub mcp: McpConfig,
     pub channels: ChannelsConfig,
     pub tls: TlsConfig,
     pub auth: AuthConfig,
@@ -80,6 +81,26 @@ pub struct MoltisConfig {
     pub user: UserProfile,
     pub hooks: Option<HooksConfig>,
     pub memory: MemoryEmbeddingConfig,
+    pub tailscale: TailscaleConfig,
+}
+
+/// Tailscale Serve/Funnel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    /// Tailscale mode: "off", "serve", or "funnel".
+    pub mode: String,
+    /// Reset tailscale serve/funnel when the gateway shuts down.
+    pub reset_on_exit: bool,
+}
+
+impl Default for TailscaleConfig {
+    fn default() -> Self {
+        Self {
+            mode: "off".into(),
+            reset_on_exit: true,
+        }
+    }
 }
 
 /// Memory embedding provider configuration.
@@ -160,6 +181,38 @@ pub struct SkillsConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// MCP (Model Context Protocol) server configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Configured MCP servers, keyed by server name.
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerEntry>,
+}
+
+/// Configuration for a single MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerEntry {
+    /// Command to spawn the server process (stdio transport).
+    #[serde(default)]
+    pub command: String,
+    /// Arguments to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables to set for the process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Whether this server is enabled. Defaults to true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Transport type: "stdio" (default) or "sse".
+    #[serde(default)]
+    pub transport: String,
+    /// URL for SSE transport. Required when `transport` is "sse".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Channel configuration.
