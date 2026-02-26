@@ -931,12 +931,12 @@ timeout = 5
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="local-validation"><a class="header" href="#local-validation">Local Validation</a></h1>
 <p>Moltis provides a local validation script that runs the same checks as CI
-(format, lint, test, e2e) on your machine.</p>
+(format, lint, test, e2e), plus a native macOS app build check on macOS hosts.</p>
 <h2 id="why-this-exists"><a class="header" href="#why-this-exists">Why this exists</a></h2>
 <ul>
 <li>Faster feedback for Rust-heavy branches (no long runner queues for every push)</li>
 <li>Better parity with a developer’s local environment while iterating</li>
-<li>Clear visibility in the PR UI (<code>fmt</code>, <code>biome</code>, <code>zizmor</code>, <code>clippy</code>, <code>test</code>, <code>e2e</code>)</li>
+<li>Clear visibility in the PR UI (<code>fmt</code>, <code>biome</code>, <code>zizmor</code>, <code>clippy</code>, <code>test</code>, <code>macos-app</code>, <code>e2e</code>)</li>
 </ul>
 <h2 id="run-local-validation"><a class="header" href="#run-local-validation">Run local validation</a></h2>
 <p>Run all checks on your current checkout:</p>
@@ -954,6 +954,7 @@ statuses to GitHub:</p>
 <li><code>local/lockfile</code> — verifies <code>Cargo.lock</code> is in sync (<code>cargo fetch --locked</code>)</li>
 <li><code>local/lint</code></li>
 <li><code>local/test</code></li>
+<li><code>local/macos-app</code> — validates the native Swift macOS app build (<code>Darwin</code> only)</li>
 <li><code>local/e2e</code> — runs gateway UI Playwright coverage</li>
 </ul>
 <p>In PR mode, the PR workflow verifies these contexts and surfaces them as
@@ -970,6 +971,9 @@ non-CUDA test/coverage defaults for local runs.</li>
 not already available.</li>
 <li><code>zizmor</code> is advisory in local runs and does not block lint/test execution.</li>
 <li>Test output is suppressed unless tests fail.</li>
+<li><code>local/macos-app</code> runs only on macOS; on Linux it is marked skipped.</li>
+<li>Override or disable macOS app validation with:
+<code>LOCAL_VALIDATE_MACOS_APP_CMD</code> and <code>LOCAL_VALIDATE_SKIP_MACOS_APP=1</code>.</li>
 <li><code>local/e2e</code> auto-runs <code>npm ci</code> only when <code>crates/web/ui/node_modules</code>
 is missing, then runs <code>npm run e2e:install</code> and <code>npm run e2e</code>. Override with
 <code>LOCAL_VALIDATE_E2E_CMD</code>.</li>
@@ -4535,6 +4539,248 @@ moltis-gateway = { default-features = false, features = ["web-ui", "tls"] }
 <li>Click “Unregister” on the moltis service worker</li>
 <li>Reload the page</li>
 </ol>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="native-swift-app-with-embedded-moltis-rust-core-poc"><a class="header" href="#native-swift-app-with-embedded-moltis-rust-core-poc">Native Swift App with Embedded Moltis Rust Core (POC)</a></h1>
+<p>This guide shows a <strong>proof-of-concept path</strong> to build a native Swift app where Swift is the UI layer and Moltis Rust code is embedded as a local library.</p>
+<p>Goal:</p>
+<ul>
+<li>Keep business/runtime logic in Rust.</li>
+<li>Build native iOS/macOS UI in Swift/SwiftUI.</li>
+<li>Ship as one app bundle from the Swift side (no separate Rust service process).</li>
+</ul>
+<h2 id="feasibility"><a class="header" href="#feasibility">Feasibility</a></h2>
+<p>Yes — this architecture is feasible with an FFI boundary.</p>
+<p>The most practical POC shape is:</p>
+<ol>
+<li>Add a small Rust crate that compiles as <code>staticlib</code>.</li>
+<li>Expose a narrow C ABI (<code>extern "C"</code>) surface.</li>
+<li>Call that ABI from Swift via a bridging header/module map.</li>
+<li>Keep Swift responsible for presentation and user interaction.</li>
+</ol>
+<h2 id="recommended-poc-architecture"><a class="header" href="#recommended-poc-architecture">Recommended POC Architecture</a></h2>
+<pre><code>SwiftUI / UIKit / AppKit
+        |
+        v
+Swift wrapper types (safe Swift API)
+        |
+        v
+C ABI bridge (headers + extern "C")
+        |
+        v
+Rust core facade (thin FFI-safe layer)
+        |
+        v
+Existing Moltis crates (chat/providers/config/etc.)
+</code></pre>
+<h3 id="boundary-rules"><a class="header" href="#boundary-rules">Boundary Rules</a></h3>
+<p>For the POC, keep the ABI intentionally small:</p>
+<ul>
+<li><code>moltis_version()</code></li>
+<li><code>moltis_chat_json(request_json)</code></li>
+<li><code>moltis_free_string(ptr)</code></li>
+<li><code>moltis_shutdown()</code></li>
+</ul>
+<p>Pass JSON strings across FFI to avoid unstable struct layouts early on.</p>
+<h2 id="rust-side-implementation-notes"><a class="header" href="#rust-side-implementation-notes">Rust-side Implementation Notes</a></h2>
+<p>Create a dedicated bridge crate (example name: <code>crates/swift-bridge</code>):</p>
+<ul>
+<li><code>crate-type = ["staticlib"]</code> for Apple targets.</li>
+<li>Keep all <code>extern "C"</code> functions in one module.</li>
+<li>Never expose internal Rust structs directly.</li>
+<li>Return <code>*mut c_char</code> and provide explicit free functions.</li>
+<li>Convert internal errors into structured JSON error payloads.</li>
+</ul>
+<p>Safety checklist:</p>
+<ul>
+<li>Validate all incoming pointers and UTF-8.</li>
+<li>Do not panic across FFI boundaries (<code>catch_unwind</code> at boundary).</li>
+<li>Keep ownership explicit (allocator symmetry for returned memory).</li>
+<li>Do not leak secrets into logs or debug output.</li>
+</ul>
+<h2 id="swift-side-integration-notes"><a class="header" href="#swift-side-integration-notes">Swift-side Integration Notes</a></h2>
+<p>Use YAML-generated Xcode projects for the POC (no hand-maintained <code>.xcodeproj</code>):</p>
+<ol>
+<li>Define app targets in <code>apps/macos/project.yml</code>.</li>
+<li>Generate project with XcodeGen.</li>
+<li>Link <code>Generated/libmoltis_bridge.a</code> and include <code>Generated/moltis_bridge.h</code>.</li>
+<li>Use a Swift facade (<code>MoltisClient</code>) to own pointer and lifetime rules.</li>
+<li>Keep Swift linted via <code>apps/macos/.swiftlint.yml</code>.</li>
+</ol>
+<p>From repo root:</p>
+<pre><code class="language-bash">just swift-build-rust
+just swift-generate
+just swift-lint
+just swift-build
+</code></pre>
+<p>The UI remains purely SwiftUI while core requests/responses flow through the Rust bridge.</p>
+<h2 id="intel--apple-silicon-universal-libmoltis"><a class="header" href="#intel--apple-silicon-universal-libmoltis">Intel + Apple Silicon (Universal <code>libmoltis</code>)</a></h2>
+<p>Yes — you can build <code>libmoltis</code> for both Intel and Apple Silicon and merge them into one universal macOS static library.</p>
+<h3 id="build-both-architectures"><a class="header" href="#build-both-architectures">Build both architectures</a></h3>
+<pre><code class="language-bash">rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+# Intel
+cargo build -p moltis-swift-bridge --release --target x86_64-apple-darwin
+
+# Apple Silicon
+cargo build -p moltis-swift-bridge --release --target aarch64-apple-darwin
+</code></pre>
+<h3 id="merge-into-one-universal-archive"><a class="header" href="#merge-into-one-universal-archive">Merge into one universal archive</a></h3>
+<pre><code class="language-bash">mkdir -p target/universal-macos/release
+lipo -create \
+  target/x86_64-apple-darwin/release/libmoltis_bridge.a \
+  target/aarch64-apple-darwin/release/libmoltis_bridge.a \
+  -output target/universal-macos/release/libmoltis_bridge.a
+
+lipo -info target/universal-macos/release/libmoltis_bridge.a
+</code></pre>
+<p>This universal <code>libmoltis_bridge.a</code> can then be linked by your Swift macOS app, so one app build supports both Intel and M-series Macs.</p>
+<h3 id="recommended-packaging-for-xcode"><a class="header" href="#recommended-packaging-for-xcode">Recommended packaging for Xcode</a></h3>
+<p>For production, prefer an <code>XCFramework</code> (device/simulator/platform-safe packaging) rather than manually juggling multiple <code>.a</code> files.</p>
+<h2 id="asyncstreaming-strategy"><a class="header" href="#asyncstreaming-strategy">Async/Streaming Strategy</a></h2>
+<p>Moltis is async-first. For a POC:</p>
+<ul>
+<li>Start with request/response calls over FFI.</li>
+<li>Add streaming in phase 2 using callback registration or poll handles.</li>
+</ul>
+<p>Simple incremental plan:</p>
+<ol>
+<li>Blocking/synchronous POC call (prove bridge correctness).</li>
+<li>Background <code>Task</code> wrapping on Swift side.</li>
+<li>Token streaming callback API when stable.</li>
+</ol>
+<h2 id="single-binary-expectation-clarification"><a class="header" href="#single-binary-expectation-clarification">Single-Binary Expectation Clarification</a></h2>
+<p>On Apple platforms, you typically ship a <strong>single app artifact</strong> that includes Swift executable + statically linked Rust library in one app bundle.</p>
+<p>So for your POC requirement (Swift UI app that embeds Rust core without a separate Rust daemon), this is achievable.</p>
+<h2 id="poc-milestones"><a class="header" href="#poc-milestones">POC Milestones</a></h2>
+<ol>
+<li>Add <code>swift-bridge</code> crate exposing one health function (<code>moltis_version</code>).</li>
+<li>Add one end-to-end chat method (<code>moltis_chat_json</code>).</li>
+<li>Build and link from minimal SwiftUI app.</li>
+<li>Validate memory lifecycle with repeated calls.</li>
+<li>Expand API surface only after the boundary is stable.</li>
+</ol>
+<h2 id="risks-to-watch-early"><a class="header" href="#risks-to-watch-early">Risks to Watch Early</a></h2>
+<ul>
+<li>ABI drift (solve with one owned header and narrow API).</li>
+<li>Threading assumptions across Swift and Rust runtimes.</li>
+<li>Logging and secret handling at the boundary.</li>
+<li>Cross-target build complexity (simulator vs device architectures).</li>
+</ul>
+<h2 id="why-this-fits-moltis"><a class="header" href="#why-this-fits-moltis">Why This Fits Moltis</a></h2>
+<p>Moltis already has clear crate boundaries and async services. A thin FFI facade lets Swift own the native UX while reusing provider orchestration, config, and session logic from Rust.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="macos-app-ffi-bridge-work-in-progress"><a class="header" href="#macos-app-ffi-bridge-work-in-progress">macOS App FFI Bridge (Work in Progress)</a></h1>
+<div id="admonition-warning" class="admonition admonish-warning" role="note" aria-labelledby="admonition-warning-title">
+<div class="admonition-title">
+<div id="admonition-warning-title">
+<p>Warning</p>
+</div>
+<a class="admonition-anchor-link" href="macos-app-ffi-bridge.html#admonition-warning"></a>
+</div>
+<div>
+<p>This macOS app integration is not finished yet. It is currently being built.</p>
+</div>
+</div>
+<p>This page documents how <code>apps/macos</code> currently bridges Swift to Rust through FFI.</p>
+<h2 id="runtime-architecture"><a class="header" href="#runtime-architecture">Runtime Architecture</a></h2>
+<pre><code class="language-text">┌──────────────────────────────────────────────────────────────────────────┐
+│ Moltis.app (single macOS process)                                        │
+│                                                                          │
+│  SwiftUI Views                                                           │
+│  (ContentView, OnboardingView, SettingsView, ...)                        │
+│                    │                                                     │
+│                    ▼                                                     │
+│  State stores                                                            │
+│  (ChatStore, ProviderStore, LogStore)                                    │
+│                    │                                                     │
+│                    ▼                                                     │
+│  Swift FFI facade: MoltisClient.swift                                    │
+│  - encodes requests to JSON                                              │
+│  - calls C symbols from `moltis_bridge.h`                                │
+│  - decodes JSON responses / bridge errors                                │
+└────────────────────┬─────────────────────────────────────────────────────┘
+                     │
+                     │ C ABI (`moltis_*`)
+                     ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Rust bridge static library: `libmoltis_bridge.a`                         │
+│ crate: `crates/swift-bridge`                                             │
+│                                                                          │
+│  `extern "C"` exports                                                    │
+│  (chat, streaming, providers, sessions, httpd, version, shutdown, ...)   │
+│                    │                                                     │
+│                    ▼                                                     │
+│  Rust bridge internals                                                   │
+│  - pointer/UTF-8 + JSON validation                                       │
+│  - panic boundary (`catch_unwind`)                                       │
+│  - tokio runtime + provider registry + session storage                   │
+└────────────────────┬─────────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Reused Moltis crates                                                     │
+│ (`moltis-providers`, `moltis-sessions`, `moltis-gateway`, etc.)          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Reverse direction callbacks:
+- Rust logs: `moltis_set_log_callback(...)` -&gt; Swift `LogStore`
+- Rust streaming events: `moltis_*_chat_stream(...)` callback -&gt; Swift closures
+- Rust session events: `moltis_set_session_event_callback(...)` -&gt; Swift `ChatStore`
+</code></pre>
+<h2 id="build-and-link-pipeline"><a class="header" href="#build-and-link-pipeline">Build and Link Pipeline</a></h2>
+<pre><code class="language-text">`just swift-build-rust`
+        │
+        ▼
+scripts/build-swift-bridge.sh
+  1) cargo build -p moltis-swift-bridge --target x86_64-apple-darwin
+  2) cargo build -p moltis-swift-bridge --target aarch64-apple-darwin
+  3) lipo -create -&gt; universal `libmoltis_bridge.a`
+  4) cbindgen -&gt; `moltis_bridge.h`
+  5) copy both artifacts into `apps/macos/Generated/`
+        │
+        ▼
+`just swift-generate` (xcodegen from `apps/macos/project.yml`)
+        │
+        ▼
+Xcode build
+  - header search path: `apps/macos/Generated`
+  - library search path: `apps/macos/Generated`
+  - links `-lmoltis_bridge`
+  - uses `Sources/Bridging-Header.h` -&gt; includes `moltis_bridge.h`
+</code></pre>
+<h2 id="main-ffi-touchpoints"><a class="header" href="#main-ffi-touchpoints">Main FFI Touchpoints</a></h2>
+<ul>
+<li>Swift header import: <code>apps/macos/Sources/Bridging-Header.h</code></li>
+<li>Swift facade: <code>apps/macos/Sources/MoltisClient.swift</code></li>
+<li>Rust exports: <code>crates/swift-bridge/src/lib.rs</code></li>
+<li>Artifact builder: <code>scripts/build-swift-bridge.sh</code></li>
+<li>Xcode linking config: <code>apps/macos/project.yml</code></li>
+</ul>
+<h2 id="real-time-session-sync"><a class="header" href="#real-time-session-sync">Real-time Session Sync</a></h2>
+<p>Sessions created in the macOS app appear in the web UI (and vice versa) in
+real time thanks to a shared <code>tokio::sync::broadcast</code> channel — the
+<code>SessionEventBus</code>.</p>
+<pre><code class="language-text">┌──────────────┐  publish   ┌─────────────────┐  subscribe  ┌────────────────┐
+│ Bridge FFI   │ ────────→ │ SessionEventBus  │ ────────→  │ FFI callback   │→ macOS app
+│ (macOS app)  │           │ (broadcast chan)  │            │ (bridge lib.rs)│
+└──────────────┘           └─────────────────┘            └────────────────┘
+                                  ↑
+┌──────────────┐  publish         │
+│ Gateway RPCs │ ─────────────────┘
+│ (sessions.*) │        (also broadcasts to WS clients directly)
+└──────────────┘
+</code></pre>
+<p>When HTTPD is enabled, the bridge passes its bus instance to <code>prepare_gateway()</code>
+so both share the same channel. Events:</p>
+<div class="table-wrapper"><table><thead><tr><th>Kind</th><th>Trigger</th></tr></thead><tbody>
+<tr><td><code>created</code></td><td><code>sessions.resolve</code> (new), <code>sessions.fork</code>, bridge <code>moltis_create_session</code></td></tr>
+<tr><td><code>patched</code></td><td><code>sessions.patch</code></td></tr>
+<tr><td><code>deleted</code></td><td><code>sessions.delete</code></td></tr>
+</tbody></table>
+</div>
+<p>Swift receives events via <code>moltis_set_session_event_callback</code> — each event is a
+JSON object <code>{"kind":"created","sessionKey":"..."}</code> dispatched to
+<code>ChatStore.handleSessionEvent()</code> on the main thread.</p>
+<h2 id="current-status"><a class="header" href="#current-status">Current Status</a></h2>
+<p>The bridge is already functional for core flows (version, chat, streaming, providers, sessions, embedded httpd), but this is still a POC-stage macOS app and the integration surface is still evolving.</p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="openclaw-import"><a class="header" href="#openclaw-import">OpenClaw Import</a></h1>
 <p>Moltis can automatically detect and import data from an existing <a href="https://docs.openclaw.ai">OpenClaw</a> installation. This lets you migrate to Moltis without losing your provider keys, memory files, skills, sessions, or channel configuration.</p>
 <h2 id="how-detection-works"><a class="header" href="#how-detection-works">How Detection Works</a></h2>
@@ -7181,6 +7427,8 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <h2 id="unreleased"><a class="header" href="#unreleased">[Unreleased]</a></h2>
 <h3 id="added"><a class="header" href="#added">Added</a></h3>
 <ul>
+<li>Real-time session sync between macOS app and web UI via <code>SessionEventBus</code> (<code>tokio::sync::broadcast</code>). Sessions created, deleted, or patched in one UI instantly appear in the other. New FFI callback <code>moltis_set_session_event_callback</code> and WebSocket <code>"session"</code> events for create/delete/fork operations.</li>
+<li>Swift bridge: persistent session storage via FFI — <code>moltis_list_sessions</code>, <code>moltis_switch_session</code>, <code>moltis_create_session</code>, <code>moltis_session_chat_stream</code> functions backed by JSONL files and shared SQLite metadata (<code>moltis.db</code>) across all UIs (macOS app, web, TUI)</li>
 <li><strong>Internationalization (i18n)</strong>: web UI now supports runtime language switching via <code>i18next</code> with English and French locales. Error codes use structured constants with locale-aware error messages across API handlers, terminal, chat, and environment routes. Onboarding step labels, navigation buttons, and page strings use translation keys (<code>t()</code> calls)</li>
 <li><strong>Vault UI</strong>: recovery key display during onboarding password setup, vault status/unlock controls in Settings &gt; Security, encrypted/plaintext badges on environment variables</li>
 <li><strong>Encryption-at-rest vault</strong> (<code>vault</code> feature, default on) — environment variables are encrypted with XChaCha20-Poly1305 AEAD using Argon2id-derived keys. Vault is initialized on first password setup and auto-unsealed on login. Recovery key provided at initialization for emergency access. API: <code>/api/auth/vault/status</code>, <code>/api/auth/vault/unlock</code>, <code>/api/auth/vault/recovery</code></li>
@@ -7191,6 +7439,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li><code>graphql</code> feature flag (default on) in gateway and CLI crates for compile-time opt-out</li>
 <li>Settings &gt; GraphQL page embedding GraphiQL playground at <code>/settings/graphql</code></li>
 <li>Gateway startup now seeds a built-in <code>dcg-guard</code> hook in <code>~/.moltis/hooks/dcg-guard/</code> (manifest + handler), so destructive command guarding is available out of the box once <code>dcg</code> is installed</li>
+<li>Swift embedding POC scaffold with a new <code>moltis-swift-bridge</code> static library crate, XcodeGen YAML project (<code>apps/macos/project.yml</code>), and SwiftLint wiring for SwiftUI frontend code quality</li>
 <li>New <code>moltis-openclaw-import</code> crate for detecting OpenClaw installations and selectively importing identity, providers, skills, memory files, Telegram channels, sessions, and MCP servers</li>
 <li>New onboarding RPC methods: <code>openclaw.detect</code>, <code>openclaw.scan</code>, and <code>openclaw.import</code></li>
 <li>New <code>moltis import</code> CLI commands (<code>detect</code>, <code>all</code>, <code>select</code>) with <code>--dry-run</code> and <code>--json</code> output options</li>
@@ -7218,6 +7467,7 @@ onboarding-ready configs.</li>
 <li>Gateway and CLI now enable the <code>openclaw-import</code> feature in default builds</li>
 <li>Providers now support <code>stream_transport = "sse" | "websocket" | "auto"</code> in config. OpenAI can stream via Responses API WebSocket mode, and <code>auto</code> falls back to SSE when WebSocket setup is unavailable.</li>
 <li>Agent Identity emoji picker now includes 🐰 🐹 🦀 🦞 🦝 🦭 🧠 🧭 options</li>
+<li>Added architecture docs for a native Swift UI app embedding Moltis Rust core through a C FFI bridge (<code>docs/src/native-swift-embedding.md</code>)</li>
 <li>Channel persistence and message-log queries are now channel-type scoped (<code>channel_type + account_id</code>) so Telegram and Teams accounts can share the same account IDs safely</li>
 <li>Chat/system prompt resolution is now agent-aware, loading <code>IDENTITY.md</code>, <code>SOUL.md</code>, <code>MEMORY.md</code>, <code>AGENTS.md</code>, and <code>TOOLS.md</code> from the active session agent workspace with backward-compatible fallbacks</li>
 <li>Memory tool operations and compaction memory writes are now agent-scoped, preventing cross-agent memory leakage during search/read/write flows</li>

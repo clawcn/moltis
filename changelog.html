@@ -190,6 +190,8 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <h2 id="unreleased"><a class="header" href="#unreleased">[Unreleased]</a></h2>
 <h3 id="added"><a class="header" href="#added">Added</a></h3>
 <ul>
+<li>Real-time session sync between macOS app and web UI via <code>SessionEventBus</code> (<code>tokio::sync::broadcast</code>). Sessions created, deleted, or patched in one UI instantly appear in the other. New FFI callback <code>moltis_set_session_event_callback</code> and WebSocket <code>"session"</code> events for create/delete/fork operations.</li>
+<li>Swift bridge: persistent session storage via FFI — <code>moltis_list_sessions</code>, <code>moltis_switch_session</code>, <code>moltis_create_session</code>, <code>moltis_session_chat_stream</code> functions backed by JSONL files and shared SQLite metadata (<code>moltis.db</code>) across all UIs (macOS app, web, TUI)</li>
 <li><strong>Internationalization (i18n)</strong>: web UI now supports runtime language switching via <code>i18next</code> with English and French locales. Error codes use structured constants with locale-aware error messages across API handlers, terminal, chat, and environment routes. Onboarding step labels, navigation buttons, and page strings use translation keys (<code>t()</code> calls)</li>
 <li><strong>Vault UI</strong>: recovery key display during onboarding password setup, vault status/unlock controls in Settings &gt; Security, encrypted/plaintext badges on environment variables</li>
 <li><strong>Encryption-at-rest vault</strong> (<code>vault</code> feature, default on) — environment variables are encrypted with XChaCha20-Poly1305 AEAD using Argon2id-derived keys. Vault is initialized on first password setup and auto-unsealed on login. Recovery key provided at initialization for emergency access. API: <code>/api/auth/vault/status</code>, <code>/api/auth/vault/unlock</code>, <code>/api/auth/vault/recovery</code></li>
@@ -200,6 +202,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li><code>graphql</code> feature flag (default on) in gateway and CLI crates for compile-time opt-out</li>
 <li>Settings &gt; GraphQL page embedding GraphiQL playground at <code>/settings/graphql</code></li>
 <li>Gateway startup now seeds a built-in <code>dcg-guard</code> hook in <code>~/.moltis/hooks/dcg-guard/</code> (manifest + handler), so destructive command guarding is available out of the box once <code>dcg</code> is installed</li>
+<li>Swift embedding POC scaffold with a new <code>moltis-swift-bridge</code> static library crate, XcodeGen YAML project (<code>apps/macos/project.yml</code>), and SwiftLint wiring for SwiftUI frontend code quality</li>
 <li>New <code>moltis-openclaw-import</code> crate for detecting OpenClaw installations and selectively importing identity, providers, skills, memory files, Telegram channels, sessions, and MCP servers</li>
 <li>New onboarding RPC methods: <code>openclaw.detect</code>, <code>openclaw.scan</code>, and <code>openclaw.import</code></li>
 <li>New <code>moltis import</code> CLI commands (<code>detect</code>, <code>all</code>, <code>select</code>) with <code>--dry-run</code> and <code>--json</code> output options</li>
@@ -227,6 +230,7 @@ onboarding-ready configs.</li>
 <li>Gateway and CLI now enable the <code>openclaw-import</code> feature in default builds</li>
 <li>Providers now support <code>stream_transport = "sse" | "websocket" | "auto"</code> in config. OpenAI can stream via Responses API WebSocket mode, and <code>auto</code> falls back to SSE when WebSocket setup is unavailable.</li>
 <li>Agent Identity emoji picker now includes 🐰 🐹 🦀 🦞 🦝 🦭 🧠 🧭 options</li>
+<li>Added architecture docs for a native Swift UI app embedding Moltis Rust core through a C FFI bridge (<code>docs/src/native-swift-embedding.md</code>)</li>
 <li>Channel persistence and message-log queries are now channel-type scoped (<code>channel_type + account_id</code>) so Telegram and Teams accounts can share the same account IDs safely</li>
 <li>Chat/system prompt resolution is now agent-aware, loading <code>IDENTITY.md</code>, <code>SOUL.md</code>, <code>MEMORY.md</code>, <code>AGENTS.md</code>, and <code>TOOLS.md</code> from the active session agent workspace with backward-compatible fallbacks</li>
 <li>Memory tool operations and compaction memory writes are now agent-scoped, preventing cross-agent memory leakage during search/read/write flows</li>

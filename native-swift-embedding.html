@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Local Validation - Moltis Documentation</title>
+        <title>Native Swift Embedding (POC) - Moltis Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -149,7 +149,7 @@
                         <a href="https://github.com/moltis-org/moltis" title="Git repository" aria-label="Git repository">
                             <i id="git-repository-button" class="fa fa-github"></i>
                         </a>
-                        <a href="https://github.com/moltis-org/moltis/edit/main/docs/src/src/local-validation.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/moltis-org/moltis/edit/main/docs/src/src/native-swift-embedding.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <i id="git-edit-button" class="fa fa-edit"></i>
                         </a>
 
@@ -183,69 +183,144 @@
 
                 <div id="content" class="content">
                     <main>
-                        <h1 id="local-validation"><a class="header" href="#local-validation">Local Validation</a></h1>
-<p>Moltis provides a local validation script that runs the same checks as CI
-(format, lint, test, e2e), plus a native macOS app build check on macOS hosts.</p>
-<h2 id="why-this-exists"><a class="header" href="#why-this-exists">Why this exists</a></h2>
+                        <h1 id="native-swift-app-with-embedded-moltis-rust-core-poc"><a class="header" href="#native-swift-app-with-embedded-moltis-rust-core-poc">Native Swift App with Embedded Moltis Rust Core (POC)</a></h1>
+<p>This guide shows a <strong>proof-of-concept path</strong> to build a native Swift app where Swift is the UI layer and Moltis Rust code is embedded as a local library.</p>
+<p>Goal:</p>
 <ul>
-<li>Faster feedback for Rust-heavy branches (no long runner queues for every push)</li>
-<li>Better parity with a developer’s local environment while iterating</li>
-<li>Clear visibility in the PR UI (<code>fmt</code>, <code>biome</code>, <code>zizmor</code>, <code>clippy</code>, <code>test</code>, <code>macos-app</code>, <code>e2e</code>)</li>
+<li>Keep business/runtime logic in Rust.</li>
+<li>Build native iOS/macOS UI in Swift/SwiftUI.</li>
+<li>Ship as one app bundle from the Swift side (no separate Rust service process).</li>
 </ul>
-<h2 id="run-local-validation"><a class="header" href="#run-local-validation">Run local validation</a></h2>
-<p>Run all checks on your current checkout:</p>
-<pre><code class="language-bash">./scripts/local-validate.sh
+<h2 id="feasibility"><a class="header" href="#feasibility">Feasibility</a></h2>
+<p>Yes — this architecture is feasible with an FFI boundary.</p>
+<p>The most practical POC shape is:</p>
+<ol>
+<li>Add a small Rust crate that compiles as <code>staticlib</code>.</li>
+<li>Expose a narrow C ABI (<code>extern "C"</code>) surface.</li>
+<li>Call that ABI from Swift via a bridging header/module map.</li>
+<li>Keep Swift responsible for presentation and user interaction.</li>
+</ol>
+<h2 id="recommended-poc-architecture"><a class="header" href="#recommended-poc-architecture">Recommended POC Architecture</a></h2>
+<pre><code>SwiftUI / UIKit / AppKit
+        |
+        v
+Swift wrapper types (safe Swift API)
+        |
+        v
+C ABI bridge (headers + extern "C")
+        |
+        v
+Rust core facade (thin FFI-safe layer)
+        |
+        v
+Existing Moltis crates (chat/providers/config/etc.)
 </code></pre>
-<p>When working on a pull request, pass the PR number to also publish commit
-statuses to GitHub:</p>
-<pre><code class="language-bash">./scripts/local-validate.sh 63
+<h3 id="boundary-rules"><a class="header" href="#boundary-rules">Boundary Rules</a></h3>
+<p>For the POC, keep the ABI intentionally small:</p>
+<ul>
+<li><code>moltis_version()</code></li>
+<li><code>moltis_chat_json(request_json)</code></li>
+<li><code>moltis_free_string(ptr)</code></li>
+<li><code>moltis_shutdown()</code></li>
+</ul>
+<p>Pass JSON strings across FFI to avoid unstable struct layouts early on.</p>
+<h2 id="rust-side-implementation-notes"><a class="header" href="#rust-side-implementation-notes">Rust-side Implementation Notes</a></h2>
+<p>Create a dedicated bridge crate (example name: <code>crates/swift-bridge</code>):</p>
+<ul>
+<li><code>crate-type = ["staticlib"]</code> for Apple targets.</li>
+<li>Keep all <code>extern "C"</code> functions in one module.</li>
+<li>Never expose internal Rust structs directly.</li>
+<li>Return <code>*mut c_char</code> and provide explicit free functions.</li>
+<li>Convert internal errors into structured JSON error payloads.</li>
+</ul>
+<p>Safety checklist:</p>
+<ul>
+<li>Validate all incoming pointers and UTF-8.</li>
+<li>Do not panic across FFI boundaries (<code>catch_unwind</code> at boundary).</li>
+<li>Keep ownership explicit (allocator symmetry for returned memory).</li>
+<li>Do not leak secrets into logs or debug output.</li>
+</ul>
+<h2 id="swift-side-integration-notes"><a class="header" href="#swift-side-integration-notes">Swift-side Integration Notes</a></h2>
+<p>Use YAML-generated Xcode projects for the POC (no hand-maintained <code>.xcodeproj</code>):</p>
+<ol>
+<li>Define app targets in <code>apps/macos/project.yml</code>.</li>
+<li>Generate project with XcodeGen.</li>
+<li>Link <code>Generated/libmoltis_bridge.a</code> and include <code>Generated/moltis_bridge.h</code>.</li>
+<li>Use a Swift facade (<code>MoltisClient</code>) to own pointer and lifetime rules.</li>
+<li>Keep Swift linted via <code>apps/macos/.swiftlint.yml</code>.</li>
+</ol>
+<p>From repo root:</p>
+<pre><code class="language-bash">just swift-build-rust
+just swift-generate
+just swift-lint
+just swift-build
 </code></pre>
-<p>The script runs these checks:</p>
+<p>The UI remains purely SwiftUI while core requests/responses flow through the Rust bridge.</p>
+<h2 id="intel--apple-silicon-universal-libmoltis"><a class="header" href="#intel--apple-silicon-universal-libmoltis">Intel + Apple Silicon (Universal <code>libmoltis</code>)</a></h2>
+<p>Yes — you can build <code>libmoltis</code> for both Intel and Apple Silicon and merge them into one universal macOS static library.</p>
+<h3 id="build-both-architectures"><a class="header" href="#build-both-architectures">Build both architectures</a></h3>
+<pre><code class="language-bash">rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+# Intel
+cargo build -p moltis-swift-bridge --release --target x86_64-apple-darwin
+
+# Apple Silicon
+cargo build -p moltis-swift-bridge --release --target aarch64-apple-darwin
+</code></pre>
+<h3 id="merge-into-one-universal-archive"><a class="header" href="#merge-into-one-universal-archive">Merge into one universal archive</a></h3>
+<pre><code class="language-bash">mkdir -p target/universal-macos/release
+lipo -create \
+  target/x86_64-apple-darwin/release/libmoltis_bridge.a \
+  target/aarch64-apple-darwin/release/libmoltis_bridge.a \
+  -output target/universal-macos/release/libmoltis_bridge.a
+
+lipo -info target/universal-macos/release/libmoltis_bridge.a
+</code></pre>
+<p>This universal <code>libmoltis_bridge.a</code> can then be linked by your Swift macOS app, so one app build supports both Intel and M-series Macs.</p>
+<h3 id="recommended-packaging-for-xcode"><a class="header" href="#recommended-packaging-for-xcode">Recommended packaging for Xcode</a></h3>
+<p>For production, prefer an <code>XCFramework</code> (device/simulator/platform-safe packaging) rather than manually juggling multiple <code>.a</code> files.</p>
+<h2 id="asyncstreaming-strategy"><a class="header" href="#asyncstreaming-strategy">Async/Streaming Strategy</a></h2>
+<p>Moltis is async-first. For a POC:</p>
 <ul>
-<li><code>local/fmt</code></li>
-<li><code>local/biome</code></li>
-<li><code>local/zizmor</code></li>
-<li><code>local/lockfile</code> — verifies <code>Cargo.lock</code> is in sync (<code>cargo fetch --locked</code>)</li>
-<li><code>local/lint</code></li>
-<li><code>local/test</code></li>
-<li><code>local/macos-app</code> — validates the native Swift macOS app build (<code>Darwin</code> only)</li>
-<li><code>local/e2e</code> — runs gateway UI Playwright coverage</li>
+<li>Start with request/response calls over FFI.</li>
+<li>Add streaming in phase 2 using callback registration or poll handles.</li>
 </ul>
-<p>In PR mode, the PR workflow verifies these contexts and surfaces them as
-checks in the PR.</p>
-<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
+<p>Simple incremental plan:</p>
+<ol>
+<li>Blocking/synchronous POC call (prove bridge correctness).</li>
+<li>Background <code>Task</code> wrapping on Swift side.</li>
+<li>Token streaming callback API when stable.</li>
+</ol>
+<h2 id="single-binary-expectation-clarification"><a class="header" href="#single-binary-expectation-clarification">Single-Binary Expectation Clarification</a></h2>
+<p>On Apple platforms, you typically ship a <strong>single app artifact</strong> that includes Swift executable + statically linked Rust library in one app bundle.</p>
+<p>So for your POC requirement (Swift UI app that embeds Rust core without a separate Rust daemon), this is achievable.</p>
+<h2 id="poc-milestones"><a class="header" href="#poc-milestones">POC Milestones</a></h2>
+<ol>
+<li>Add <code>swift-bridge</code> crate exposing one health function (<code>moltis_version</code>).</li>
+<li>Add one end-to-end chat method (<code>moltis_chat_json</code>).</li>
+<li>Build and link from minimal SwiftUI app.</li>
+<li>Validate memory lifecycle with repeated calls.</li>
+<li>Expand API surface only after the boundary is stable.</li>
+</ol>
+<h2 id="risks-to-watch-early"><a class="header" href="#risks-to-watch-early">Risks to Watch Early</a></h2>
 <ul>
-<li>The script requires a clean working tree (no uncommitted or untracked
-changes). Commit or stash local changes before running.</li>
-<li>On macOS without CUDA (<code>nvcc</code>), the script automatically falls back to
-non-CUDA test/coverage defaults for local runs.</li>
-<li><code>local/lint</code> uses the same clippy flags as CI and release:
-<code>cargo +nightly-2025-11-30 clippy -Z unstable-options --workspace --all-features --all-targets --timings -- -D warnings</code>.</li>
-<li><code>zizmor</code> is installed automatically (Homebrew on macOS, apt on Linux) when
-not already available.</li>
-<li><code>zizmor</code> is advisory in local runs and does not block lint/test execution.</li>
-<li>Test output is suppressed unless tests fail.</li>
-<li><code>local/macos-app</code> runs only on macOS; on Linux it is marked skipped.</li>
-<li>Override or disable macOS app validation with:
-<code>LOCAL_VALIDATE_MACOS_APP_CMD</code> and <code>LOCAL_VALIDATE_SKIP_MACOS_APP=1</code>.</li>
-<li><code>local/e2e</code> auto-runs <code>npm ci</code> only when <code>crates/web/ui/node_modules</code>
-is missing, then runs <code>npm run e2e:install</code> and <code>npm run e2e</code>. Override with
-<code>LOCAL_VALIDATE_E2E_CMD</code>.</li>
+<li>ABI drift (solve with one owned header and narrow API).</li>
+<li>Threading assumptions across Swift and Rust runtimes.</li>
+<li>Logging and secret handling at the boundary.</li>
+<li>Cross-target build complexity (simulator vs device architectures).</li>
 </ul>
-<h2 id="merge-and-release-safety"><a class="header" href="#merge-and-release-safety">Merge and release safety</a></h2>
-<p>This local-first flow is for pull requests. Full CI still runs on GitHub
-runners for non-PR events (for example push to <code>main</code>, scheduled runs, and
-release paths).</p>
+<h2 id="why-this-fits-moltis"><a class="header" href="#why-this-fits-moltis">Why This Fits Moltis</a></h2>
+<p>Moltis already has clear crate boundaries and async services. A thin FFI facade lets Swift own the native UX while reusing provider orchestration, config, and session logic from Rust.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="configuration.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="mobile-pwa.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="e2e-testing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="macos-app-ffi-bridge.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -255,11 +330,11 @@ release paths).</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="configuration.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="mobile-pwa.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="e2e-testing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="macos-app-ffi-bridge.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>
