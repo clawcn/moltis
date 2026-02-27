@@ -349,6 +349,17 @@ env = { GITHUB_TOKEN = "ghp_..." }
 token = "123456:ABC..."
 allowed_users = [123456789]     # Telegram user IDs allowed to chat
 </code></pre>
+<h2 id="discord-integration"><a class="header" href="#discord-integration">Discord Integration</a></h2>
+<pre><code class="language-toml">[channels]
+offered = ["telegram", "discord"]
+
+[channels.discord.my-bot]
+token = "MTIzNDU2Nzg5.example.bot-token"
+dm_policy = "allowlist"
+mention_mode = "mention"
+allowlist = ["your_username"]
+</code></pre>
+<p>See <a href="discord.html">Discord</a> for full configuration reference and setup instructions.</p>
 <h2 id="tls--https"><a class="header" href="#tls--https">TLS / HTTPS</a></h2>
 <pre><code class="language-toml">[tls]
 enabled = true

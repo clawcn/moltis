@@ -190,6 +190,14 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <h2 id="unreleased"><a class="header" href="#unreleased">[Unreleased]</a></h2>
 <h3 id="added"><a class="header" href="#added">Added</a></h3>
 <ul>
+<li>Discord channel integration via new <code>moltis-discord</code> crate using serenity Gateway API (persistent WebSocket, no public URL required). Supports DM and group messaging with allowlist/OTP gating, mention mode, guild allowlist, and 2000-char message chunking. Web UI: connect/edit/remove Discord bots in Settings &gt; Channels and onboarding flow</li>
+<li>Discord reply-to-message support: set <code>reply_to_message = true</code> to have the bot send responses as Discord threaded replies to the user’s message</li>
+<li>Discord ack reactions: set <code>ack_reaction = "👀"</code> to add an emoji reaction while processing (removed on completion)</li>
+<li>Discord bot token import from OpenClaw installations during onboarding (both flat and multi-account configs)</li>
+<li>Discord bot presence/activity: configure <code>activity</code>, <code>activity_type</code> (playing/listening/watching/competing/custom), and <code>status</code> (online/idle/dnd/invisible) in bot config</li>
+<li>Discord OTP self-approval for DMs: non-allowlisted users receive a 6-digit challenge code (visible in web UI) to self-approve access, matching Telegram’s existing OTP flow</li>
+<li>Discord native slash commands: <code>/new</code>, <code>/clear</code>, <code>/compact</code>, <code>/context</code>, <code>/model</code>, <code>/sessions</code>, <code>/agent</code>, <code>/help</code> registered as Discord application commands with ephemeral responses</li>
+<li>OTP module moved from <code>moltis-telegram</code> to shared <code>moltis-channels</code> crate for cross-platform reuse</li>
 <li>Real-time session sync between macOS app and web UI via <code>SessionEventBus</code> (<code>tokio::sync::broadcast</code>). Sessions created, deleted, or patched in one UI instantly appear in the other. New FFI callback <code>moltis_set_session_event_callback</code> and WebSocket <code>"session"</code> events for create/delete/fork operations.</li>
 <li>Swift bridge: persistent session storage via FFI — <code>moltis_list_sessions</code>, <code>moltis_switch_session</code>, <code>moltis_create_session</code>, <code>moltis_session_chat_stream</code> functions backed by JSONL files and shared SQLite metadata (<code>moltis.db</code>) across all UIs (macOS app, web, TUI)</li>
 <li><strong>Internationalization (i18n)</strong>: web UI now supports runtime language switching via <code>i18next</code> with English and French locales. Error codes use structured constants with locale-aware error messages across API handlers, terminal, chat, and environment routes. Onboarding step labels, navigation buttons, and page strings use translation keys (<code>t()</code> calls)</li>
