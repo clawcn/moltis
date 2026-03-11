@@ -3,14 +3,18 @@
 //! Provides RPC handlers for configuring the local GGUF LLM provider,
 //! including system info detection, model listing, and model configuration.
 
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use {
     async_trait::async_trait,
     serde::{Deserialize, Serialize},
     serde_json::Value,
     tokio::sync::{OnceCell, RwLock},
-    tracing::info,
+    tracing::{info, warn},
 };
 
 use moltis_providers::{ProviderRegistry, local_gguf, local_llm, raw_model_id};
@@ -98,6 +102,24 @@ pub async fn ensure_local_model_cached(
         return download_hf_mlx_repo(model_id, &cache_dir, state).await;
     }
 
+    if let Some(entry) =
+        LocalLlmConfig::load().and_then(|config| config.get_model(model_id).cloned())
+        && let Some((hf_repo, hf_filename)) = entry.custom_gguf_source()
+    {
+        let is_cached =
+            local_gguf::models::is_custom_model_cached(hf_repo, hf_filename, &cache_dir);
+        info!(
+            model_id,
+            hf_repo, hf_filename, is_cached, "custom GGUF model detected"
+        );
+
+        if is_cached {
+            return Ok(false);
+        }
+
+        return download_custom_gguf_model(model_id, hf_repo, hf_filename, &cache_dir, state).await;
+    }
+
     // Unknown model - let the provider handle it (will fail with a clear error)
     info!(model_id, "model not found in any registry");
     Ok(false)
@@ -107,7 +129,7 @@ pub async fn ensure_local_model_cached(
 async fn download_unified_model(
     model: &'static local_llm::models::LocalModelDef,
     backend: local_llm::backend::BackendType,
-    cache_dir: &std::path::Path,
+    cache_dir: &Path,
     state: &Arc<GatewayState>,
 ) -> LocalModelCacheResult<bool> {
     use moltis_providers::local_llm::models as llm_models;
@@ -220,7 +242,7 @@ async fn download_unified_model(
 /// Download a model from the legacy registry with progress broadcasting.
 async fn download_legacy_model(
     model: &'static local_gguf::models::GgufModelDef,
-    cache_dir: &std::path::Path,
+    cache_dir: &Path,
     state: &Arc<GatewayState>,
 ) -> LocalModelCacheResult<bool> {
     let model_id = model.id.to_string();
@@ -328,10 +350,110 @@ async fn download_legacy_model(
     }
 }
 
+/// Download an arbitrary HuggingFace GGUF file with progress broadcasting.
+async fn download_custom_gguf_model(
+    model_id: &str,
+    hf_repo: &str,
+    hf_filename: &str,
+    cache_dir: &Path,
+    state: &Arc<GatewayState>,
+) -> LocalModelCacheResult<bool> {
+    let display_name = hf_filename.to_string();
+
+    broadcast(
+        state,
+        "local-llm.download",
+        serde_json::json!({
+            "modelId": model_id,
+            "displayName": display_name,
+            "status": "starting",
+            "message": "Missing model on disk, downloading...",
+        }),
+        BroadcastOpts::default(),
+    )
+    .await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
+    let state_for_progress = Arc::clone(state);
+    let model_id_for_broadcast = model_id.to_string();
+    let display_name_for_broadcast = display_name.clone();
+
+    let broadcast_task = tokio::spawn(async move {
+        while let Some((downloaded, total)) = rx.recv().await {
+            let progress = total.map(|t| {
+                if t > 0 {
+                    (downloaded as f64 / t as f64 * 100.0).min(100.0)
+                } else {
+                    0.0
+                }
+            });
+            broadcast(
+                &state_for_progress,
+                "local-llm.download",
+                serde_json::json!({
+                    "modelId": model_id_for_broadcast,
+                    "displayName": display_name_for_broadcast,
+                    "downloaded": downloaded,
+                    "total": total,
+                    "progress": progress,
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+        }
+    });
+
+    let result = local_gguf::models::ensure_custom_model_with_progress(
+        hf_repo,
+        hf_filename,
+        cache_dir,
+        |p| {
+            let _ = tx.send((p.downloaded, p.total));
+        },
+    )
+    .await;
+
+    drop(tx);
+    let _ = broadcast_task.await;
+
+    match result {
+        Ok(_) => {
+            broadcast(
+                state,
+                "local-llm.download",
+                serde_json::json!({
+                    "modelId": model_id,
+                    "displayName": display_name,
+                    "progress": 100.0,
+                    "complete": true,
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+            Ok(true)
+        },
+        Err(e) => {
+            broadcast(
+                state,
+                "local-llm.download",
+                serde_json::json!({
+                    "modelId": model_id,
+                    "error": e.to_string(),
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+            Err(LocalModelCacheError::message(format!(
+                "Failed to download model: {e}"
+            )))
+        },
+    }
+}
+
 /// Download an arbitrary HuggingFace MLX repo with progress broadcasting.
 async fn download_hf_mlx_repo(
     hf_repo: &str,
-    cache_dir: &std::path::Path,
+    cache_dir: &Path,
     state: &Arc<GatewayState>,
 ) -> LocalModelCacheResult<bool> {
     let model_id = hf_repo.to_string();
@@ -523,6 +645,10 @@ pub struct LocalModelEntry {
     pub model_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_filename: Option<String>,
     #[serde(default)]
     pub gpu_layers: u32,
     /// Backend to use: "GGUF" or "MLX"
@@ -572,6 +698,8 @@ impl LocalLlmConfig {
                 models: vec![LocalModelEntry {
                     model_id: legacy.model_id,
                     model_path: legacy.model_path,
+                    hf_repo: None,
+                    hf_filename: None,
                     gpu_layers: legacy.gpu_layers,
                     backend: legacy.backend,
                 }],
@@ -612,6 +740,127 @@ impl LocalLlmConfig {
     /// Get a model by ID.
     pub fn get_model(&self, model_id: &str) -> Option<&LocalModelEntry> {
         self.models.iter().find(|m| m.model_id == model_id)
+    }
+}
+
+impl LocalModelEntry {
+    fn backend_type(&self) -> Option<local_llm::backend::BackendType> {
+        match self.backend.as_str() {
+            "GGUF" => Some(local_llm::backend::BackendType::Gguf),
+            "MLX" => Some(local_llm::backend::BackendType::Mlx),
+            _ => None,
+        }
+    }
+
+    fn custom_gguf_source(&self) -> Option<(&str, &str)> {
+        if self.backend != "GGUF" {
+            return None;
+        }
+
+        Some((self.hf_repo.as_deref()?, self.hf_filename.as_deref()?))
+    }
+
+    fn resolved_model_path(&self, cache_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+        if let Some((hf_repo, hf_filename)) = self.custom_gguf_source() {
+            return local_gguf::models::custom_model_path(hf_repo, hf_filename, cache_dir)
+                .map(Some);
+        }
+
+        if let Some(path) = &self.model_path {
+            return Ok(Some(path.clone()));
+        }
+
+        Ok(None)
+    }
+
+    fn display_name(&self) -> String {
+        if let Some(def) = local_llm::models::find_model(&self.model_id) {
+            return def.display_name.to_string();
+        }
+        if let Some(def) = local_gguf::models::find_model(&self.model_id) {
+            return def.display_name.to_string();
+        }
+        if let Some(filename) = &self.hf_filename {
+            return filename.clone();
+        }
+        if let Some(repo) = &self.hf_repo {
+            return repo.clone();
+        }
+        if let Some(path) = &self.model_path
+            && let Some(name) = path.file_name().and_then(|part| part.to_str())
+        {
+            return name.to_string();
+        }
+        format!("{} (local)", self.model_id)
+    }
+}
+
+fn slugify_model_component(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn custom_gguf_model_id(hf_repo: &str, hf_filename: &str) -> String {
+    let repo_slug = slugify_model_component(hf_repo);
+    let filename_slug = slugify_model_component(hf_filename);
+    format!("custom-{repo_slug}-{filename_slug}")
+}
+
+fn build_local_provider_entry(
+    entry: &LocalModelEntry,
+) -> anyhow::Result<(
+    moltis_providers::ModelInfo,
+    Arc<local_llm::LocalLlmProvider>,
+)> {
+    let cache_dir = local_gguf::models::default_models_dir();
+    let llm_config = local_llm::LocalLlmConfig {
+        model_id: entry.model_id.clone(),
+        model_path: entry.resolved_model_path(&cache_dir)?,
+        backend: entry.backend_type(),
+        context_size: None,
+        gpu_layers: entry.gpu_layers,
+        temperature: 0.7,
+        cache_dir,
+    };
+    let provider = Arc::new(local_llm::LocalLlmProvider::new(llm_config));
+    let info = moltis_providers::ModelInfo {
+        id: entry.model_id.clone(),
+        provider: "local-llm".into(),
+        display_name: entry.display_name(),
+        created_at: None,
+    };
+    Ok((info, provider))
+}
+
+fn register_local_model_entry(
+    registry: &mut ProviderRegistry,
+    entry: &LocalModelEntry,
+) -> anyhow::Result<()> {
+    let (info, provider) = build_local_provider_entry(entry)?;
+    let _ = registry.unregister(&entry.model_id);
+    registry.register(info, provider);
+    Ok(())
+}
+
+pub fn register_saved_local_models(registry: &mut ProviderRegistry) {
+    let Some(config) = LocalLlmConfig::load() else {
+        return;
+    };
+
+    for entry in &config.models {
+        if let Err(error) = register_local_model_entry(registry, entry) {
+            warn!(model_id = %entry.model_id, %error, "failed to register saved local model");
+        }
     }
 }
 
@@ -865,13 +1114,16 @@ impl LocalLlmService for LiveLocalLlmService {
         }
 
         // Save configuration (add to existing models)
-        let mut config = LocalLlmConfig::load().unwrap_or_default();
-        config.add_model(LocalModelEntry {
+        let entry = LocalModelEntry {
             model_id: model_id.clone(),
             model_path: None,
+            hf_repo: None,
+            hf_filename: None,
             gpu_layers: 0,
             backend: backend.clone(),
-        });
+        };
+        let mut config = LocalLlmConfig::load().unwrap_or_default();
+        config.add_model(entry.clone());
         config
             .save()
             .map_err(|e| format!("failed to save config: {e}"))?;
@@ -967,28 +1219,10 @@ impl LocalLlmService for LiveLocalLlmService {
 
                     // Register the provider in the registry
                     // Use LocalLlmProvider which auto-detects backend (GGUF or MLX)
-                    let llm_config = local_llm::LocalLlmConfig {
-                        model_id: model_id_clone.clone(),
-                        model_path: None,
-                        backend: None, // Auto-detect based on model type
-                        context_size: None,
-                        gpu_layers: 0,
-                        temperature: 0.7,
-                        cache_dir,
-                    };
-
-                    let provider = Arc::new(local_llm::LocalLlmProvider::new(llm_config));
-
                     let mut reg = registry.write().await;
-                    reg.register(
-                        moltis_providers::ModelInfo {
-                            id: model_id_clone.clone(),
-                            provider: "local-llm".into(),
-                            display_name,
-                            created_at: None,
-                        },
-                        provider,
-                    );
+                    if let Err(error) = register_local_model_entry(&mut reg, &entry) {
+                        tracing::error!(model = %model_id_clone, %error, "failed to register local model");
+                    }
 
                     let mut s = status.write().await;
                     *s = LocalLlmStatus::Ready {
@@ -1066,6 +1300,10 @@ impl LocalLlmService for LiveLocalLlmService {
             .unwrap_or("GGUF")
             .to_string();
 
+        if backend != "GGUF" && backend != "MLX" {
+            return Err(format!("invalid backend: {backend}. Must be GGUF or MLX").into());
+        }
+
         // For GGUF, we need the filename
         let hf_filename = params
             .get("hfFilename")
@@ -1077,33 +1315,44 @@ impl LocalLlmService for LiveLocalLlmService {
             return Err("GGUF models require 'hfFilename' parameter".into());
         }
 
-        // For MLX models, use the HuggingFace repo ID directly as the model ID
-        // so the provider can download it automatically. For GGUF, keep the
-        // custom- prefix since the repo alone isn't enough (needs filename).
         let model_id = if backend == "MLX" {
             hf_repo.clone()
         } else {
-            format!(
-                "custom-{}",
-                hf_repo
-                    .split('/')
-                    .next_back()
-                    .unwrap_or(&hf_repo)
-                    .to_lowercase()
-                    .replace(' ', "-")
+            custom_gguf_model_id(
+                &hf_repo,
+                hf_filename
+                    .as_deref()
+                    .ok_or_else(|| "GGUF models require 'hfFilename' parameter".to_string())?,
             )
         };
 
         info!(model = %model_id, repo = %hf_repo, backend = %backend, "configuring custom model");
 
-        // Save configuration (add to existing models)
-        let mut config = LocalLlmConfig::load().unwrap_or_default();
-        config.add_model(LocalModelEntry {
+        if backend == "GGUF" {
+            let filename = hf_filename
+                .as_deref()
+                .ok_or_else(|| "GGUF models require 'hfFilename' parameter".to_string())?;
+            local_gguf::models::custom_model_path(
+                &hf_repo,
+                filename,
+                &local_gguf::models::default_models_dir(),
+            )
+            .map_err(|e| format!("invalid GGUF filename: {e}"))?;
+        }
+
+        let entry = LocalModelEntry {
             model_id: model_id.clone(),
             model_path: None,
+            hf_repo: Some(hf_repo.clone()),
+            hf_filename: hf_filename.clone(),
             gpu_layers: 0,
             backend: backend.clone(),
-        });
+        };
+        let display_name = entry.display_name();
+
+        // Save configuration (add to existing models)
+        let mut config = LocalLlmConfig::load().unwrap_or_default();
+        config.add_model(entry.clone());
         config
             .save()
             .map_err(|e| format!("failed to save config: {e}"))?;
@@ -1117,20 +1366,132 @@ impl LocalLlmService for LiveLocalLlmService {
             };
         }
 
-        // For custom models, we'll need to handle download differently
-        // For now, just mark as ready (actual download happens on first use)
-        {
-            let mut status = self.status.write().await;
-            *status = LocalLlmStatus::Ready {
-                model_id: model_id.clone(),
+        let status = Arc::clone(&self.status);
+        let registry = Arc::clone(&self.registry);
+        let state_cell = Arc::clone(&self.state);
+        let cache_dir = local_gguf::models::default_models_dir();
+        let model_id_clone = model_id.clone();
+        let hf_repo_for_download = hf_repo.clone();
+        let hf_filename_for_download = hf_filename.clone();
+        let backend_for_download = backend.clone();
+        let display_name_for_task = display_name.clone();
+
+        tokio::spawn(async move {
+            let state = state_cell.get().cloned();
+            let Some(state_for_download) = state.as_ref() else {
+                let error = "gateway state unavailable for custom model download".to_string();
+                let mut s = status.write().await;
+                *s = LocalLlmStatus::Error {
+                    model_id: model_id_clone,
+                    error,
+                };
+                return;
             };
-        }
+
+            let result = if backend_for_download == "MLX" {
+                local_llm::models::ensure_mlx_repo_with_progress(
+                    &hf_repo_for_download,
+                    &cache_dir,
+                    |_| {},
+                )
+                .await
+            } else {
+                let Some(filename) = hf_filename_for_download.as_deref() else {
+                    let mut s = status.write().await;
+                    *s = LocalLlmStatus::Error {
+                        model_id: model_id_clone.clone(),
+                        error: "GGUF models require 'hfFilename' parameter".into(),
+                    };
+                    return;
+                };
+                local_gguf::models::ensure_custom_model_with_progress(
+                    &hf_repo_for_download,
+                    filename,
+                    &cache_dir,
+                    |p| {
+                        let state = Arc::clone(state_for_download);
+                        let model_id = model_id_clone.clone();
+                        let display_name = display_name_for_task.clone();
+                        tokio::spawn(async move {
+                            let progress = p.total.map(|t| {
+                                if t > 0 {
+                                    (p.downloaded as f64 / t as f64 * 100.0).min(100.0)
+                                } else {
+                                    0.0
+                                }
+                            });
+                            broadcast(
+                                &state,
+                                "local-llm.download",
+                                serde_json::json!({
+                                    "modelId": model_id,
+                                    "displayName": display_name,
+                                    "downloaded": p.downloaded,
+                                    "total": p.total,
+                                    "progress": progress,
+                                }),
+                                BroadcastOpts::default(),
+                            )
+                            .await;
+                        });
+                    },
+                )
+                .await
+            };
+
+            match result {
+                Ok(_) => {
+                    broadcast(
+                        state_for_download,
+                        "local-llm.download",
+                        serde_json::json!({
+                            "modelId": model_id_clone,
+                            "displayName": display_name_for_task,
+                            "progress": 100.0,
+                            "complete": true,
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+
+                    let mut reg = registry.write().await;
+                    if let Err(error) = register_local_model_entry(&mut reg, &entry) {
+                        tracing::error!(model = %entry.model_id, %error, "failed to register custom local model");
+                    }
+
+                    let mut s = status.write().await;
+                    *s = LocalLlmStatus::Ready {
+                        model_id: entry.model_id.clone(),
+                    };
+                },
+                Err(e) => {
+                    tracing::error!(model = %entry.model_id, error = %e, "failed to download custom local model");
+                    broadcast(
+                        state_for_download,
+                        "local-llm.download",
+                        serde_json::json!({
+                            "modelId": entry.model_id.clone(),
+                            "error": e.to_string(),
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+
+                    let mut s = status.write().await;
+                    *s = LocalLlmStatus::Error {
+                        model_id: entry.model_id.clone(),
+                        error: e.to_string(),
+                    };
+                },
+            }
+        });
 
         Ok(serde_json::json!({
             "ok": true,
             "modelId": model_id,
             "hfRepo": hf_repo,
             "backend": backend,
+            "displayName": display_name,
         }))
     }
 
@@ -1272,7 +1633,33 @@ struct HfModelInfo {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+
+    fn local_model_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct LocalModelConfigTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl LocalModelConfigTestGuard {
+        fn new() -> Self {
+            Self {
+                _lock: local_model_config_test_lock(),
+            }
+        }
+    }
+
+    impl Drop for LocalModelConfigTestGuard {
+        fn drop(&mut self) {
+            moltis_config::clear_config_dir();
+            moltis_config::clear_data_dir();
+        }
+    }
 
     #[test]
     fn test_local_llm_config_serialization() {
@@ -1280,6 +1667,8 @@ mod tests {
         config.add_model(LocalModelEntry {
             model_id: "qwen2.5-coder-7b-q4_k_m".into(),
             model_path: None,
+            hf_repo: None,
+            hf_filename: None,
             gpu_layers: 0,
             backend: "GGUF".into(),
         });
@@ -1292,17 +1681,69 @@ mod tests {
     }
 
     #[test]
+    fn test_local_llm_config_round_trip_preserves_custom_gguf_metadata() {
+        let mut config = LocalLlmConfig::default();
+        let repo = "Qwen/Qwen3-4B-GGUF";
+        let first = LocalModelEntry {
+            model_id: custom_gguf_model_id(repo, "Qwen3-4B-Q4_K_M.gguf"),
+            model_path: None,
+            hf_repo: Some(repo.into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        let second = LocalModelEntry {
+            model_id: custom_gguf_model_id(repo, "Qwen3-4B-Q6_K.gguf"),
+            model_path: None,
+            hf_repo: Some(repo.into()),
+            hf_filename: Some("Qwen3-4B-Q6_K.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+
+        config.add_model(first.clone());
+        config.add_model(second.clone());
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: LocalLlmConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.models.len(), 2);
+        assert_eq!(
+            parsed
+                .get_model(&first.model_id)
+                .and_then(|entry| entry.hf_repo.as_deref()),
+            Some(repo)
+        );
+        assert_eq!(
+            parsed
+                .get_model(&first.model_id)
+                .and_then(|entry| entry.hf_filename.as_deref()),
+            Some("Qwen3-4B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            parsed
+                .get_model(&second.model_id)
+                .and_then(|entry| entry.hf_filename.as_deref()),
+            Some("Qwen3-4B-Q6_K.gguf")
+        );
+    }
+
+    #[test]
     fn test_local_llm_config_multi_model() {
         let mut config = LocalLlmConfig::default();
         config.add_model(LocalModelEntry {
             model_id: "model-1".into(),
             model_path: None,
+            hf_repo: None,
+            hf_filename: None,
             gpu_layers: 0,
             backend: "GGUF".into(),
         });
         config.add_model(LocalModelEntry {
             model_id: "model-2".into(),
             model_path: None,
+            hf_repo: None,
+            hf_filename: None,
             gpu_layers: 0,
             backend: "MLX".into(),
         });
@@ -1476,29 +1917,115 @@ mod tests {
 
     #[test]
     fn test_custom_model_id_generation() {
-        // Test that custom model IDs are generated correctly
-        let repo = "TheBloke/Llama-2-7B-GGUF";
-        let model_id = format!(
-            "custom-{}",
-            repo.split('/')
-                .next_back()
-                .unwrap_or(repo)
-                .to_lowercase()
-                .replace(' ', "-")
-        );
-        assert_eq!(model_id, "custom-llama-2-7b-gguf");
+        let model_id = custom_gguf_model_id("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf");
+        assert_eq!(model_id, "custom-qwen-qwen3-4b-gguf-qwen3-4b-q4-k-m-gguf");
+    }
 
-        let repo2 = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit";
-        let model_id2 = format!(
-            "custom-{}",
-            repo2
-                .split('/')
-                .next_back()
-                .unwrap_or(repo2)
-                .to_lowercase()
-                .replace(' ', "-")
+    #[test]
+    fn test_custom_model_id_generation_distinguishes_filenames_in_same_repo() {
+        let repo = "Qwen/Qwen3-4B-GGUF";
+        let first = custom_gguf_model_id(repo, "Qwen3-4B-Q4_K_M.gguf");
+        let second = custom_gguf_model_id(repo, "Qwen3-4B-Q6_K.gguf");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_custom_model_path_resolution_uses_repo_scoped_cache_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+        let entry = LocalModelEntry {
+            model_id: custom_gguf_model_id("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
+            model_path: None,
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+
+        let resolved = entry.resolved_model_path(cache_dir).unwrap();
+        assert_eq!(
+            resolved,
+            Some(
+                cache_dir
+                    .join("custom")
+                    .join("Qwen__Qwen3-4B-GGUF")
+                    .join("Qwen3-4B-Q4_K_M.gguf")
+            )
         );
-        assert_eq!(model_id2, "custom-qwen2.5-coder-7b-instruct-4bit");
+    }
+
+    #[test]
+    fn test_custom_model_path_resolution_prefers_repo_metadata_over_stale_saved_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+        let entry = LocalModelEntry {
+            model_id: custom_gguf_model_id("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
+            model_path: Some(PathBuf::from("/tmp/stale-model.gguf")),
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+
+        let resolved = entry.resolved_model_path(cache_dir).unwrap();
+        assert_eq!(
+            resolved,
+            Some(
+                cache_dir
+                    .join("custom")
+                    .join("Qwen__Qwen3-4B-GGUF")
+                    .join("Qwen3-4B-Q4_K_M.gguf")
+            )
+        );
+    }
+
+    #[test]
+    fn test_custom_model_display_name_prefers_filename() {
+        let entry = LocalModelEntry {
+            model_id: "custom-test".into(),
+            model_path: None,
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+
+        assert_eq!(entry.display_name(), "Qwen3-4B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_register_saved_local_models_registers_custom_gguf_provider_from_saved_config() {
+        let _guard = LocalModelConfigTestGuard::new();
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+
+        let entry = LocalModelEntry {
+            model_id: custom_gguf_model_id("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
+            model_path: None,
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        let config = LocalLlmConfig {
+            models: vec![entry.clone()],
+        };
+        config.save().unwrap();
+
+        let mut registry = ProviderRegistry::empty();
+        register_saved_local_models(&mut registry);
+
+        assert!(registry.get(&entry.model_id).is_some());
+        let registered = registry
+            .list_models()
+            .iter()
+            .find(|model| raw_model_id(&model.id) == entry.model_id)
+            .unwrap();
+        assert_eq!(registered.provider, "local-llm");
+        assert_eq!(registered.display_name, "Qwen3-4B-Q4_K_M.gguf");
     }
 
     #[test]

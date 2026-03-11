@@ -1511,6 +1511,11 @@ pub async fn prepare_gateway(
             &config_env_overrides,
         ),
     ));
+    #[cfg(feature = "local-llm")]
+    {
+        let mut reg = registry.write().await;
+        crate::local_llm_setup::register_saved_local_models(&mut reg);
+    }
     let (provider_summary, providers_available_at_startup) = {
         let reg = registry.read().await;
         log_startup_model_inventory(&reg);
