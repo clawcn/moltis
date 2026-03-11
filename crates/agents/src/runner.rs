@@ -47,6 +47,15 @@ fn sanitize_tool_name(name: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+const MALFORMED_TOOL_RETRY_PROMPT: &str = "Your tool call was malformed. Retry with exact format:\n\
+     ```tool_call\n{\"tool\": \"name\", \"arguments\": {...}}\n```";
+
+fn find_empty_tool_name_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
+    tool_calls
+        .iter()
+        .find(|tc| sanitize_tool_name(&tc.name).is_empty())
+}
+
 /// Error patterns that indicate the context window has been exceeded.
 const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
     "context_length_exceeded",
@@ -793,10 +802,7 @@ pub async fn run_agent_loop_with_context(
             messages.push(ChatMessage::assistant(
                 response.text.as_deref().unwrap_or(""),
             ));
-            messages.push(ChatMessage::user(
-                "Your tool call was malformed. Retry with exact format:\n\
-                 ```tool_call\n{\"tool\": \"name\", \"arguments\": {...}}\n```",
-            ));
+            messages.push(ChatMessage::user(MALFORMED_TOOL_RETRY_PROMPT));
             continue;
         }
 
@@ -838,6 +844,21 @@ pub async fn run_agent_loop_with_context(
                 name: "exec".to_string(),
                 arguments: serde_json::json!({ "command": command }),
             }];
+        }
+
+        if let Some(tc) = find_empty_tool_name_call(&response.tool_calls) {
+            if malformed_retry_count == 0 {
+                malformed_retry_count += 1;
+                info!(tool_call_id = %tc.id, "detected structured tool call with empty name, requesting retry");
+                messages.push(ChatMessage::assistant(
+                    response.text.as_deref().unwrap_or(""),
+                ));
+                messages.push(ChatMessage::user(MALFORMED_TOOL_RETRY_PROMPT));
+                continue;
+            }
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "malformed tool call: empty tool name"
+            )));
         }
 
         for tc in &response.tool_calls {
@@ -1451,10 +1472,7 @@ pub async fn run_agent_loop_streaming(
             malformed_retry_count += 1;
             info!("detected malformed tool call in stream, requesting retry");
             messages.push(ChatMessage::assistant(&accumulated_text));
-            messages.push(ChatMessage::user(
-                "Your tool call was malformed. Retry with exact format:\n\
-                 ```tool_call\n{\"tool\": \"name\", \"arguments\": {...}}\n```",
-            ));
+            messages.push(ChatMessage::user(MALFORMED_TOOL_RETRY_PROMPT));
             continue;
         }
 
@@ -1489,6 +1507,19 @@ pub async fn run_agent_loop_streaming(
                 name: "exec".to_string(),
                 arguments: serde_json::json!({ "command": command }),
             }];
+        }
+
+        if let Some(tc) = find_empty_tool_name_call(&tool_calls) {
+            if malformed_retry_count == 0 {
+                malformed_retry_count += 1;
+                info!(tool_call_id = %tc.id, "detected structured tool call with empty name in stream, requesting retry");
+                messages.push(ChatMessage::assistant(&accumulated_text));
+                messages.push(ChatMessage::user(MALFORMED_TOOL_RETRY_PROMPT));
+                continue;
+            }
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "malformed tool call: empty tool name"
+            )));
         }
 
         // Dispatch AfterLLMCall hook — may block tool execution.
@@ -2176,6 +2207,321 @@ mod tests {
         assert_eq!(result.text, "Done!");
         assert_eq!(result.iterations, 2);
         assert_eq!(result.tool_calls_made, 1);
+    }
+
+    struct EmptyToolNameProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for EmptyToolNameProvider {
+        fn name(&self) -> &str {
+            "mock-empty-tool-name"
+        }
+
+        fn id(&self) -> &str {
+            "mock-empty-tool-name"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match count {
+                0 => Ok(CompletionResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_empty".into(),
+                        name: "   ".into(),
+                        arguments: serde_json::json!({"text": "hello"}),
+                    }],
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                }),
+                1 => {
+                    let retry_prompt = messages
+                        .iter()
+                        .rev()
+                        .find_map(|m| match m {
+                            ChatMessage::User {
+                                content: UserContent::Text(text),
+                            } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    assert!(
+                        retry_prompt.contains("Retry with exact format"),
+                        "runner should ask for a retry, got: {retry_prompt}"
+                    );
+                    Ok(CompletionResponse {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call_echo".into(),
+                            name: "echo_tool".into(),
+                            arguments: serde_json::json!({"text": "hello"}),
+                        }],
+                        usage: Usage {
+                            input_tokens: 8,
+                            output_tokens: 4,
+                            ..Default::default()
+                        },
+                    })
+                },
+                _ => {
+                    let tool_content = messages
+                        .iter()
+                        .find_map(|m| match m {
+                            ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    assert!(
+                        tool_content.contains("\"text\":\"hello\""),
+                        "tool result should include echoed payload, got: {tool_content}"
+                    );
+                    Ok(CompletionResponse {
+                        text: Some("Done after retry".into()),
+                        tool_calls: vec![],
+                        usage: Usage {
+                            input_tokens: 6,
+                            output_tokens: 3,
+                            ..Default::default()
+                        },
+                    })
+                },
+            }
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_structured_tool_name_retries_non_streaming() {
+        let provider = Arc::new(EmptyToolNameProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Use the tool"),
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Done after retry");
+        assert_eq!(result.iterations, 3, "retry + tool call + final text");
+        assert_eq!(
+            result.tool_calls_made, 1,
+            "blank-name call must not execute"
+        );
+
+        let tool_starts: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RunnerEvent::ToolCallStart { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_starts, vec!["echo_tool".to_string()]);
+    }
+
+    struct EmptyToolNameStreamProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for EmptyToolNameStreamProvider {
+        fn name(&self) -> &str {
+            "mock-empty-tool-name-stream"
+        }
+
+        fn id(&self) -> &str {
+            "mock-empty-tool-name-stream"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some("fallback".into()),
+                tool_calls: vec![],
+                usage: Usage::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            self.stream_with_tools(_messages, vec![])
+        }
+
+        fn stream_with_tools(
+            &self,
+            messages: Vec<ChatMessage>,
+            _tools: Vec<serde_json::Value>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match count {
+                0 => Box::pin(tokio_stream::iter(vec![
+                    StreamEvent::ToolCallStart {
+                        id: "call_empty".into(),
+                        name: " ".into(),
+                        index: 0,
+                    },
+                    StreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        delta: r#"{"text":"hello"}"#.into(),
+                    },
+                    StreamEvent::ToolCallComplete { index: 0 },
+                    StreamEvent::Done(Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    }),
+                ])),
+                1 => {
+                    let retry_prompt = messages
+                        .iter()
+                        .rev()
+                        .find_map(|m| match m {
+                            ChatMessage::User {
+                                content: UserContent::Text(text),
+                            } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    assert!(
+                        retry_prompt.contains("Retry with exact format"),
+                        "runner should ask for a retry, got: {retry_prompt}"
+                    );
+                    Box::pin(tokio_stream::iter(vec![
+                        StreamEvent::ToolCallStart {
+                            id: "call_echo".into(),
+                            name: "echo_tool".into(),
+                            index: 0,
+                        },
+                        StreamEvent::ToolCallArgumentsDelta {
+                            index: 0,
+                            delta: r#"{"text":"hello"}"#.into(),
+                        },
+                        StreamEvent::ToolCallComplete { index: 0 },
+                        StreamEvent::Done(Usage {
+                            input_tokens: 8,
+                            output_tokens: 4,
+                            ..Default::default()
+                        }),
+                    ]))
+                },
+                _ => {
+                    let tool_content = messages
+                        .iter()
+                        .find_map(|m| match m {
+                            ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    assert!(
+                        tool_content.contains("\"text\":\"hello\""),
+                        "tool result should include echoed payload, got: {tool_content}"
+                    );
+                    Box::pin(tokio_stream::iter(vec![
+                        StreamEvent::Delta("Done after retry".into()),
+                        StreamEvent::Done(Usage {
+                            input_tokens: 6,
+                            output_tokens: 3,
+                            ..Default::default()
+                        }),
+                    ]))
+                },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_structured_tool_name_retries_streaming() {
+        let provider = Arc::new(EmptyToolNameStreamProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop_streaming(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Use the tool"),
+            Some(&on_event),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Done after retry");
+        assert_eq!(result.iterations, 3, "retry + tool call + final text");
+        assert_eq!(
+            result.tool_calls_made, 1,
+            "blank-name call must not execute"
+        );
+
+        let tool_starts: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                RunnerEvent::ToolCallStart { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_starts, vec!["echo_tool".to_string()]);
     }
 
     /// Mock provider that calls the "exec" tool (native) and verifies result fed back.
