@@ -174,6 +174,7 @@ impl BrowserContainer {
         viewport_width: u32,
         viewport_height: u32,
         low_memory_threshold_mb: u64,
+        session_timeout_ms: u64,
         profile_dir: Option<&std::path::Path>,
         container_host: &str,
     ) -> Result<Self> {
@@ -185,6 +186,7 @@ impl BrowserContainer {
             viewport_width,
             viewport_height,
             low_memory_threshold_mb,
+            session_timeout_ms,
             profile_dir,
             container_host,
         )
@@ -198,6 +200,7 @@ impl BrowserContainer {
         viewport_width: u32,
         viewport_height: u32,
         low_memory_threshold_mb: u64,
+        session_timeout_ms: u64,
         profile_dir: Option<&std::path::Path>,
         container_host: &str,
     ) -> Result<Self> {
@@ -230,6 +233,7 @@ impl BrowserContainer {
                 viewport_width,
                 viewport_height,
                 low_memory_threshold_mb,
+                session_timeout_ms,
                 profile_dir,
             )?,
             #[cfg(target_os = "macos")]
@@ -240,6 +244,7 @@ impl BrowserContainer {
                 viewport_width,
                 viewport_height,
                 low_memory_threshold_mb,
+                session_timeout_ms,
                 profile_dir,
             )?,
         };
@@ -373,6 +378,24 @@ fn build_container_launch_args(
     format!("DEFAULT_LAUNCH_ARGS=[{joined}]")
 }
 
+pub(crate) fn browserless_session_timeout_ms(
+    idle_timeout_secs: u64,
+    navigation_timeout_ms: u64,
+) -> u64 {
+    idle_timeout_secs
+        .max(crate::pool::MAX_BROWSER_INSTANCE_LIFETIME.as_secs())
+        .saturating_mul(1000)
+        .max(navigation_timeout_ms)
+}
+
+fn browserless_container_env(session_timeout_ms: u64) -> Vec<String> {
+    vec![
+        format!("TIMEOUT={session_timeout_ms}"),
+        "MAX_CONCURRENT_SESSIONS=1".to_string(),
+        "PREBOOT_CHROME=true".to_string(),
+    ]
+}
+
 /// Start a Docker container for the browser.
 fn start_oci_container(
     backend: ContainerBackend,
@@ -382,6 +405,7 @@ fn start_oci_container(
     viewport_width: u32,
     viewport_height: u32,
     low_memory_threshold_mb: u64,
+    session_timeout_ms: u64,
     profile_dir: Option<&std::path::Path>,
 ) -> Result<String> {
     let cli = backend.cli();
@@ -395,6 +419,7 @@ fn start_oci_container(
         container_profile_dir,
         backend,
     );
+    let browserless_env = browserless_container_env(session_timeout_ms);
 
     let mut run_args = vec![
         "run".to_string(),
@@ -406,12 +431,13 @@ fn start_oci_container(
         format!("{}:3000", host_port),
         "-e".to_string(),
         launch_args,
-        "-e".to_string(),
-        "MAX_CONCURRENT_SESSIONS=1".to_string(),
-        "-e".to_string(),
-        "PREBOOT_CHROME=true".to_string(),
         "--shm-size=2gb".to_string(),
     ];
+
+    for env in browserless_env {
+        run_args.push("-e".to_string());
+        run_args.push(env);
+    }
 
     // Mount the profile directory if persistence is enabled
     if let Some(host_path) = profile_dir {
@@ -456,6 +482,7 @@ fn start_apple_container(
     viewport_width: u32,
     viewport_height: u32,
     low_memory_threshold_mb: u64,
+    session_timeout_ms: u64,
     profile_dir: Option<&std::path::Path>,
 ) -> Result<String> {
     let container_name = new_browser_container_name(container_prefix);
@@ -468,6 +495,7 @@ fn start_apple_container(
         container_profile_dir,
         ContainerBackend::AppleContainer,
     );
+    let browserless_env = browserless_container_env(session_timeout_ms);
 
     let mut container_args = vec![
         "run".to_string(),
@@ -478,15 +506,16 @@ fn start_apple_container(
         format!("{}:3000", host_port),
         "-e".to_string(),
         launch_args,
-        "-e".to_string(),
-        "MAX_CONCURRENT_SESSIONS=1".to_string(),
-        "-e".to_string(),
-        "PREBOOT_CHROME=true".to_string(),
         // Chrome requires shared memory for rendering; Docker uses --shm-size=2gb,
         // Apple Container doesn't support --shm-size so mount tmpfs at /dev/shm.
         "--tmpfs".to_string(),
         "/dev/shm".to_string(),
     ];
+
+    for env in browserless_env {
+        container_args.push("-e".to_string());
+        container_args.push(env);
+    }
 
     // Mount the profile directory if persistence is enabled
     if let Some(host_path) = profile_dir {
@@ -1057,5 +1086,31 @@ mod tests {
     fn test_build_container_launch_args_docker_no_disable_shm() {
         let args = build_container_launch_args(1920, 1080, 0, None, ContainerBackend::Docker);
         assert!(!args.contains("--disable-dev-shm-usage"));
+    }
+
+    #[test]
+    fn test_browserless_session_timeout_uses_moltis_lifecycle_floor() {
+        let timeout_ms = browserless_session_timeout_ms(300, 30_000);
+        assert_eq!(timeout_ms, 1_800_000);
+    }
+
+    #[test]
+    fn test_browserless_session_timeout_respects_longer_idle_timeout() {
+        let timeout_ms = browserless_session_timeout_ms(3_600, 30_000);
+        assert_eq!(timeout_ms, 3_600_000);
+    }
+
+    #[test]
+    fn test_browserless_session_timeout_respects_longer_navigation_timeout() {
+        let timeout_ms = browserless_session_timeout_ms(60, 3_900_000);
+        assert_eq!(timeout_ms, 3_900_000);
+    }
+
+    #[test]
+    fn test_browserless_container_env_includes_timeout() {
+        let env = browserless_container_env(1_800_000);
+        assert_eq!(env[0], "TIMEOUT=1800000");
+        assert!(env.contains(&"MAX_CONCURRENT_SESSIONS=1".to_string()));
+        assert!(env.contains(&"PREBOOT_CHROME=true".to_string()));
     }
 }
