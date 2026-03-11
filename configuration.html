@@ -353,8 +353,10 @@ env = { GITHUB_TOKEN = "ghp_..." }
 <h2 id="telegram-integration"><a class="header" href="#telegram-integration">Telegram Integration</a></h2>
 <pre><code class="language-toml">[channels.telegram.my-bot]
 token = "123456:ABC..."
-allowed_users = [123456789]     # Telegram user IDs allowed to chat
+dm_policy = "allowlist"
+allowlist = ["123456789"]       # Telegram user IDs or usernames (strings)
 </code></pre>
+<p>See <a href="telegram.html">Telegram</a> for full configuration reference and setup instructions.</p>
 <h2 id="discord-integration"><a class="header" href="#discord-integration">Discord Integration</a></h2>
 <pre><code class="language-toml">[channels]
 offered = ["telegram", "discord"]
@@ -366,6 +368,17 @@ mention_mode = "mention"
 allowlist = ["your_username"]
 </code></pre>
 <p>See <a href="discord.html">Discord</a> for full configuration reference and setup instructions.</p>
+<h2 id="slack-integration"><a class="header" href="#slack-integration">Slack Integration</a></h2>
+<pre><code class="language-toml">[channels]
+offered = ["slack"]
+
+[channels.slack.my-bot]
+bot_token = "xoxb-..."
+app_token = "xapp-..."
+dm_policy = "allowlist"
+allowlist = ["U123456789"]
+</code></pre>
+<p>See <a href="slack.html">Slack</a> for full configuration reference and setup instructions.</p>
 <h2 id="tls--https"><a class="header" href="#tls--https">TLS / HTTPS</a></h2>
 <pre><code class="language-toml">[tls]
 enabled = true
