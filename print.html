@@ -734,6 +734,7 @@ priority_models = ["gpt-5.2"]
 mode = "all"                    # "off", "non-main", or "all"
 scope = "session"               # "command", "session", or "global"
 workspace_mount = "ro"          # "ro", "rw", or "none"
+# host_data_dir = "/host/path/data"  # Optional override if auto-detection cannot resolve the host path
 home_persistence = "shared"     # "off", "session", or "shared" (default: "shared")
 # shared_home_dir = "/path/to/shared-home"  # Optional path for shared mode
 backend = "auto"                # "auto", "docker", or "apple-container"
@@ -752,6 +753,10 @@ packages = [
     "golang-go",
 ]
 </code></pre>
+<p>If Moltis runs inside Docker and also mounts the host container socket
+(<code>/var/run/docker.sock</code>), Moltis now auto-detects the host path backing
+<code>/home/moltis/.moltis</code> from the parent container’s mount table. If that
+inspection cannot resolve the correct path, set <code>host_data_dir</code> explicitly.</p>
 <div id="admonition-info" class="admonition admonish-info" role="note" aria-labelledby="admonition-info-title">
 <div class="admonition-title">
 <div id="admonition-info-title">
@@ -2876,6 +2881,19 @@ home_persistence = "session"   # "off", "session", or "shared" (default)
 (defaults to <code>data_dir()/sandbox/home/shared</code>, or <code>shared_home_dir</code> if set)</li>
 </ul>
 <p>Moltis stores persisted homes under <code>data_dir()/sandbox/home/</code>.</p>
+<h2 id="docker-in-docker-workspace-mounts"><a class="header" href="#docker-in-docker-workspace-mounts">Docker-in-Docker workspace mounts</a></h2>
+<p>When Moltis runs inside a container and launches Docker-backed sandboxes via a
+mounted container socket, the sandbox bind mount source must be a host-visible
+path. Moltis auto-detects this by inspecting the parent container’s mounts. If
+that lookup fails or you want to pin the value explicitly, set
+<code>host_data_dir</code>:</p>
+<pre><code class="language-toml">[tools.exec.sandbox]
+host_data_dir = "/srv/moltis/data"
+</code></pre>
+<p>This remaps sandbox workspace mounts and default sandbox persistence paths from
+the guest <code>data_dir()</code> to the host path you provide. It is mainly an override
+for Docker-in-Docker deployments where mount auto-detection is unavailable or
+ambiguous.</p>
 <h2 id="network-policy"><a class="header" href="#network-policy">Network policy</a></h2>
 <p>By default, sandbox containers have no network access (<code>no_network = true</code>).
 For tasks that need filtered internet access, use
@@ -7866,6 +7884,17 @@ and applying resource limits via <code>ulimit</code>. Commands will execute succ
 inside the Moltis container but without filesystem or network isolation.</p>
 <p>For full container-level isolation (filesystem boundaries, network policies),
 mount the Docker socket.</p>
+<p>If Moltis is itself running in Docker and your <code>data_dir()</code> mount is backed by
+a different host path than <code>/home/moltis/.moltis</code>, Moltis will try to discover
+that host path automatically from <code>docker inspect</code>/<code>podman inspect</code>. If that
+lookup fails, add this to <code>/home/moltis/.config/moltis/moltis.toml</code> inside the
+container:</p>
+<pre><code class="language-toml">[tools.exec.sandbox]
+host_data_dir = "/absolute/host/path/to/data"
+</code></pre>
+<p>For a bind mount like <code>-v ./data:/home/moltis/.moltis</code>, use the resolved host
+path to <code>./data</code>. Restart Moltis after changing the config so new sandbox
+containers pick up the corrected mount source.</p>
 <h3 id="security-consideration"><a class="header" href="#security-consideration">Security Consideration</a></h3>
 <p>Mounting the Docker socket gives the container full access to the Docker
 daemon. This is equivalent to root access on the host for practical purposes.
