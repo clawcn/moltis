@@ -450,6 +450,7 @@ enable_agent_sidecar_files = false # Allow agents to write supplementary text fi
 # enabled = true                  # Whether this server is enabled
 # transport = "stdio"             # Transport: "stdio" (default) or "sse"
 # url = "http://..."              # URL for SSE transport
+# headers = {{ Authorization = "Bearer ${{TOKEN}}" }}  # Optional HTTP headers for SSE transport
 
 # Example: Filesystem access
 # [mcp.servers.filesystem]
@@ -467,7 +468,8 @@ enable_agent_sidecar_files = false # Allow agents to write supplementary text fi
 # Example: SSE server
 # [mcp.servers.remote]
 # transport = "sse"
-# url = "http://localhost:8080/mcp"
+# url = "http://localhost:8080/mcp?api_key=$REMOTE_MCP_KEY"
+# headers = {{ "x-api-key" = "${{REMOTE_MCP_KEY}}" }}
 # enabled = true
 
 # ══════════════════════════════════════════════════════════════════════════════
