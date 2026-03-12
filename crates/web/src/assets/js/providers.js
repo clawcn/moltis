@@ -1843,7 +1843,7 @@ function createModelCard(model, provider, totalRamGb) {
 	return card;
 }
 
-export function showModelDownloadProgress(model, _provider) {
+export function showModelDownloadProgress(model, provider) {
 	var m = els();
 	m.body.textContent = "";
 
@@ -1908,7 +1908,7 @@ export function showModelDownloadProgress(model, _provider) {
 		}
 	});
 
-	pollLocalStatus(model, _provider, status, progress, off);
+	pollLocalStatus(model, provider, status, progress, off);
 }
 
 function selectLocalModel(model, provider) {

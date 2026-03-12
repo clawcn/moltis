@@ -397,6 +397,49 @@ fn validate_hf_filename_path(hf_filename: &str) -> anyhow::Result<&Path> {
     Ok(path)
 }
 
+fn validate_hf_repo_path(hf_repo: &str) -> anyhow::Result<Vec<&str>> {
+    if hf_repo.trim().is_empty() {
+        bail!("Hugging Face repo cannot be empty");
+    }
+
+    let parts: Vec<&str> = hf_repo.split('/').collect();
+    if parts.is_empty() {
+        bail!("Hugging Face repo cannot be empty");
+    }
+
+    for part in &parts {
+        if part.is_empty() || *part == "." || *part == ".." {
+            bail!("Hugging Face repo contains invalid path component: {part:?}");
+        }
+    }
+
+    Ok(parts)
+}
+
+fn custom_model_download_url(hf_repo: &str, hf_filename: &str) -> anyhow::Result<String> {
+    let repo_parts = validate_hf_repo_path(hf_repo)?;
+    let hf_path = validate_hf_filename_path(hf_filename)?;
+    let mut url =
+        reqwest::Url::parse("https://huggingface.co").context("parsing Hugging Face base URL")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Hugging Face base URL cannot be a base"))?;
+        for part in repo_parts {
+            segments.push(part);
+        }
+        segments.push("resolve");
+        segments.push("main");
+        for component in hf_path.components() {
+            if let Component::Normal(part) = component {
+                let part = part.to_string_lossy();
+                segments.push(part.as_ref());
+            }
+        }
+    }
+    Ok(url.to_string())
+}
+
 /// Compute the cache path for a custom GGUF model from Hugging Face.
 pub fn custom_model_path(
     hf_repo: &str,
@@ -404,7 +447,11 @@ pub fn custom_model_path(
     cache_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
     let hf_path = validate_hf_filename_path(hf_filename)?;
-    let mut model_path = cache_dir.join("custom").join(hf_repo.replace('/', "__"));
+    let repo_parts = validate_hf_repo_path(hf_repo)?;
+    let mut model_path = cache_dir.join("custom");
+    for part in repo_parts {
+        model_path.push(part);
+    }
     for component in hf_path.components() {
         if let Component::Normal(part) = component {
             model_path.push(part);
@@ -505,7 +552,7 @@ where
         return Ok(model_path);
     }
 
-    let url = format!("https://huggingface.co/{hf_repo}/resolve/main/{hf_filename}");
+    let url = custom_model_download_url(hf_repo, hf_filename)?;
     let label = format!("{hf_repo}/{hf_filename}");
     download_gguf_file_with_progress(&url, &model_path, &label, &mut on_progress).await
 }
@@ -1053,7 +1100,8 @@ mod tests {
             path,
             cache_dir
                 .join("custom")
-                .join("Qwen__Qwen3-4B-GGUF")
+                .join("Qwen")
+                .join("Qwen3-4B-GGUF")
                 .join("Qwen3-4B-Q4_K_M.gguf")
         );
     }
@@ -1065,6 +1113,26 @@ mod tests {
 
         let result = custom_model_path("Qwen/Qwen3-4B-GGUF", "../escape.gguf", cache_dir);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_custom_model_path_rejects_invalid_repo_segments() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+
+        let result = custom_model_path("../escape", "Qwen3-4B-Q4_K_M.gguf", cache_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_custom_model_path_distinguishes_repo_collisions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+
+        let first = custom_model_path("foo/bar__baz", "model.gguf", cache_dir).unwrap();
+        let second = custom_model_path("foo__bar/baz", "model.gguf", cache_dir).unwrap();
+
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -1081,6 +1149,16 @@ mod tests {
             "Qwen3-4B-Q4_K_M.gguf",
             cache_dir
         ));
+    }
+
+    #[test]
+    fn test_custom_model_download_url_encodes_repo_and_filename_segments() {
+        let url = custom_model_download_url("some org/model name", "quant file.gguf").unwrap();
+
+        assert_eq!(
+            url,
+            "https://huggingface.co/some%20org/model%20name/resolve/main/quant%20file.gguf"
+        );
     }
 
     #[test]

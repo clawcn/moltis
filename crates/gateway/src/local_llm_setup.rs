@@ -816,6 +816,78 @@ fn custom_gguf_model_id(hf_repo: &str, hf_filename: &str) -> String {
     format!("custom-{repo_slug}-{filename_slug}")
 }
 
+fn legacy_custom_gguf_model_id(hf_repo: &str) -> String {
+    format!(
+        "custom-{}",
+        hf_repo
+            .split('/')
+            .next_back()
+            .unwrap_or(hf_repo)
+            .to_lowercase()
+            .replace(' ', "-")
+    )
+}
+
+fn remove_conflicting_custom_gguf_entries(
+    config: &mut LocalLlmConfig,
+    hf_repo: &str,
+    hf_filename: &str,
+) {
+    let legacy_model_id = legacy_custom_gguf_model_id(hf_repo);
+    config.models.retain(|entry| {
+        if entry.model_id == legacy_model_id {
+            return false;
+        }
+
+        !(entry.backend == "GGUF"
+            && entry.hf_repo.as_deref() == Some(hf_repo)
+            && entry.hf_filename.as_deref() == Some(hf_filename))
+    });
+}
+
+fn status_from_saved_config(config: Option<&LocalLlmConfig>) -> LocalLlmStatus {
+    config
+        .and_then(|saved| saved.models.first())
+        .map(|model| LocalLlmStatus::Ready {
+            model_id: model.model_id.clone(),
+        })
+        .unwrap_or(LocalLlmStatus::Unconfigured)
+}
+
+fn broadcast_download_progress_update(
+    state: &Arc<GatewayState>,
+    model_id: &str,
+    display_name: &str,
+    downloaded: u64,
+    total: Option<u64>,
+) {
+    let state = Arc::clone(state);
+    let model_id = model_id.to_string();
+    let display_name = display_name.to_string();
+    tokio::spawn(async move {
+        let progress = total.map(|t| {
+            if t > 0 {
+                (downloaded as f64 / t as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            }
+        });
+        broadcast(
+            &state,
+            "local-llm.download",
+            serde_json::json!({
+                "modelId": model_id,
+                "displayName": display_name,
+                "downloaded": downloaded,
+                "total": total,
+                "progress": progress,
+            }),
+            BroadcastOpts::default(),
+        )
+        .await;
+    });
+}
+
 fn build_local_provider_entry(
     entry: &LocalModelEntry,
 ) -> anyhow::Result<(
@@ -895,23 +967,11 @@ pub struct LiveLocalLlmService {
 
 impl LiveLocalLlmService {
     pub fn new(registry: Arc<RwLock<ProviderRegistry>>) -> Self {
-        // Check if we have a saved config and set initial status
-        let status = if let Some(config) = LocalLlmConfig::load() {
-            // Use first model as the "active" one for status display
-            if let Some(first_model) = config.models.first() {
-                LocalLlmStatus::Ready {
-                    model_id: first_model.model_id.clone(),
-                }
-            } else {
-                LocalLlmStatus::Unconfigured
-            }
-        } else {
-            LocalLlmStatus::Unconfigured
-        };
-
         Self {
             registry,
-            status: Arc::new(RwLock::new(status)),
+            status: Arc::new(RwLock::new(status_from_saved_config(
+                LocalLlmConfig::load().as_ref(),
+            ))),
             state: Arc::new(OnceCell::new()),
         }
     }
@@ -1352,6 +1412,12 @@ impl LocalLlmService for LiveLocalLlmService {
 
         // Save configuration (add to existing models)
         let mut config = LocalLlmConfig::load().unwrap_or_default();
+        if backend == "GGUF" {
+            let filename = hf_filename
+                .as_deref()
+                .ok_or_else(|| "GGUF models require 'hfFilename' parameter".to_string())?;
+            remove_conflicting_custom_gguf_entries(&mut config, &hf_repo, filename);
+        }
         config.add_model(entry.clone());
         config
             .save()
@@ -1392,7 +1458,15 @@ impl LocalLlmService for LiveLocalLlmService {
                 local_llm::models::ensure_mlx_repo_with_progress(
                     &hf_repo_for_download,
                     &cache_dir,
-                    |_| {},
+                    |p| {
+                        broadcast_download_progress_update(
+                            state_for_download,
+                            &model_id_clone,
+                            &display_name_for_task,
+                            p.downloaded,
+                            p.total,
+                        );
+                    },
                 )
                 .await
             } else {
@@ -1409,31 +1483,13 @@ impl LocalLlmService for LiveLocalLlmService {
                     filename,
                     &cache_dir,
                     |p| {
-                        let state = Arc::clone(state_for_download);
-                        let model_id = model_id_clone.clone();
-                        let display_name = display_name_for_task.clone();
-                        tokio::spawn(async move {
-                            let progress = p.total.map(|t| {
-                                if t > 0 {
-                                    (p.downloaded as f64 / t as f64 * 100.0).min(100.0)
-                                } else {
-                                    0.0
-                                }
-                            });
-                            broadcast(
-                                &state,
-                                "local-llm.download",
-                                serde_json::json!({
-                                    "modelId": model_id,
-                                    "displayName": display_name,
-                                    "downloaded": p.downloaded,
-                                    "total": p.total,
-                                    "progress": progress,
-                                }),
-                                BroadcastOpts::default(),
-                            )
-                            .await;
-                        });
+                        broadcast_download_progress_update(
+                            state_for_download,
+                            &model_id_clone,
+                            &display_name_for_task,
+                            p.downloaded,
+                            p.total,
+                        );
                     },
                 )
                 .await
@@ -1441,6 +1497,21 @@ impl LocalLlmService for LiveLocalLlmService {
 
             match result {
                 Ok(_) => {
+                    let current_config = LocalLlmConfig::load();
+                    if current_config
+                        .as_ref()
+                        .and_then(|config| config.get_model(&entry.model_id))
+                        .is_none()
+                    {
+                        info!(
+                            model = %entry.model_id,
+                            "custom local model was removed before download completed; skipping registration"
+                        );
+                        let mut s = status.write().await;
+                        *s = status_from_saved_config(current_config.as_ref());
+                        return;
+                    }
+
                     broadcast(
                         state_for_download,
                         "local-llm.download",
@@ -1522,10 +1593,22 @@ impl LocalLlmService for LiveLocalLlmService {
             reg.unregister(model_id);
         }
 
-        // Update status if we removed the last model
-        if config.models.is_empty() {
+        let removed_current_model = {
+            let status = self.status.read().await;
+            match &*status {
+                LocalLlmStatus::Ready { model_id }
+                | LocalLlmStatus::Loaded { model_id }
+                | LocalLlmStatus::Loading { model_id, .. }
+                | LocalLlmStatus::Error { model_id, .. } => {
+                    raw_model_id(model_id) == local_model_id
+                },
+                LocalLlmStatus::Unconfigured | LocalLlmStatus::Unavailable => false,
+            }
+        };
+
+        if config.models.is_empty() || removed_current_model {
             let mut status = self.status.write().await;
-            *status = LocalLlmStatus::Unconfigured;
+            *status = status_from_saved_config(Some(&config));
         }
 
         Ok(serde_json::json!({
@@ -1931,6 +2014,48 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_conflicting_custom_gguf_entries_removes_legacy_and_duplicate_entries() {
+        let repo = "Qwen/Qwen3-4B-GGUF";
+        let filename = "Qwen3-4B-Q4_K_M.gguf";
+        let mut config = LocalLlmConfig {
+            models: vec![
+                LocalModelEntry {
+                    model_id: legacy_custom_gguf_model_id(repo),
+                    model_path: None,
+                    hf_repo: None,
+                    hf_filename: None,
+                    gpu_layers: 0,
+                    backend: "GGUF".into(),
+                },
+                LocalModelEntry {
+                    model_id: "custom-stale".into(),
+                    model_path: None,
+                    hf_repo: Some(repo.into()),
+                    hf_filename: Some(filename.into()),
+                    gpu_layers: 0,
+                    backend: "GGUF".into(),
+                },
+                LocalModelEntry {
+                    model_id: custom_gguf_model_id(repo, "Qwen3-4B-Q6_K.gguf"),
+                    model_path: None,
+                    hf_repo: Some(repo.into()),
+                    hf_filename: Some("Qwen3-4B-Q6_K.gguf".into()),
+                    gpu_layers: 0,
+                    backend: "GGUF".into(),
+                },
+            ],
+        };
+
+        remove_conflicting_custom_gguf_entries(&mut config, repo, filename);
+
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(
+            config.models[0].model_id,
+            custom_gguf_model_id(repo, "Qwen3-4B-Q6_K.gguf")
+        );
+    }
+
+    #[test]
     fn test_custom_model_path_resolution_uses_repo_scoped_cache_path() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_dir = temp_dir.path();
@@ -1949,7 +2074,8 @@ mod tests {
             Some(
                 cache_dir
                     .join("custom")
-                    .join("Qwen__Qwen3-4B-GGUF")
+                    .join("Qwen")
+                    .join("Qwen3-4B-GGUF")
                     .join("Qwen3-4B-Q4_K_M.gguf")
             )
         );
@@ -1974,7 +2100,8 @@ mod tests {
             Some(
                 cache_dir
                     .join("custom")
-                    .join("Qwen__Qwen3-4B-GGUF")
+                    .join("Qwen")
+                    .join("Qwen3-4B-GGUF")
                     .join("Qwen3-4B-Q4_K_M.gguf")
             )
         );
