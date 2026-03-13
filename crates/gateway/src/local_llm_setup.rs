@@ -13,7 +13,7 @@ use {
     async_trait::async_trait,
     serde::{Deserialize, Serialize},
     serde_json::Value,
-    tokio::sync::{OnceCell, RwLock},
+    tokio::sync::{OnceCell, RwLock, watch},
     tracing::{info, warn},
 };
 
@@ -41,6 +41,53 @@ impl LocalModelCacheError {
 }
 
 pub type LocalModelCacheResult<T> = Result<T, LocalModelCacheError>;
+
+type DownloadProgressUpdate = (u64, Option<u64>);
+
+fn download_progress_percent(downloaded: u64, total: Option<u64>) -> Option<f64> {
+    total.map(|total_bytes| {
+        if total_bytes > 0 {
+            (downloaded as f64 / total_bytes as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        }
+    })
+}
+
+fn spawn_download_progress_broadcaster(
+    state: &Arc<GatewayState>,
+    model_id: &str,
+    display_name: &str,
+) -> (
+    watch::Sender<Option<DownloadProgressUpdate>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = watch::channel(None::<DownloadProgressUpdate>);
+    let state = Arc::clone(state);
+    let model_id = model_id.to_string();
+    let display_name = display_name.to_string();
+    let task = tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let Some((downloaded, total)) = *rx.borrow_and_update() else {
+                continue;
+            };
+            broadcast(
+                &state,
+                "local-llm.download",
+                serde_json::json!({
+                    "modelId": model_id,
+                    "displayName": display_name,
+                    "downloaded": downloaded,
+                    "total": total,
+                    "progress": download_progress_percent(downloaded, total),
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+        }
+    });
+    (tx, task)
+}
 
 /// Check if a local model is cached on disk, and download it if not.
 ///
@@ -151,56 +198,27 @@ async fn download_unified_model(
     )
     .await;
 
-    // Set up progress channel
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
-    let state_for_progress = Arc::clone(state);
-    let model_id_for_broadcast = model_id.clone();
-    let display_name_for_broadcast = display_name.clone();
-
-    // Spawn progress broadcast task
-    let broadcast_task = tokio::spawn(async move {
-        while let Some((downloaded, total)) = rx.recv().await {
-            let progress = total.map(|t| {
-                if t > 0 {
-                    (downloaded as f64 / t as f64 * 100.0).min(100.0)
-                } else {
-                    0.0
-                }
-            });
-            broadcast(
-                &state_for_progress,
-                "local-llm.download",
-                serde_json::json!({
-                    "modelId": model_id_for_broadcast,
-                    "displayName": display_name_for_broadcast,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "progress": progress,
-                }),
-                BroadcastOpts::default(),
-            )
-            .await;
-        }
-    });
+    let (progress_tx, broadcast_task) =
+        spawn_download_progress_broadcaster(state, &model_id, &display_name);
 
     // Download based on backend
     let result = match backend {
         local_llm::backend::BackendType::Gguf => {
             llm_models::ensure_model_with_progress(model, cache_dir, |p| {
-                let _ = tx.send((p.downloaded, p.total));
+                let _ = progress_tx.send(Some((p.downloaded, p.total)));
             })
             .await
         },
         local_llm::backend::BackendType::Mlx => {
             llm_models::ensure_mlx_model_with_progress(model, cache_dir, |p| {
-                let _ = tx.send((p.downloaded, p.total));
+                let _ = progress_tx.send(Some((p.downloaded, p.total)));
             })
             .await
         },
     };
 
     // Clean up
-    drop(tx);
+    drop(progress_tx);
     let _ = broadcast_task.await;
 
     match result {
@@ -262,56 +280,27 @@ async fn download_legacy_model(
     )
     .await;
 
-    // Set up progress channel
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
-    let state_for_progress = Arc::clone(state);
-    let model_id_for_broadcast = model_id.clone();
-    let display_name_for_broadcast = display_name.clone();
-
-    // Spawn progress broadcast task
-    let broadcast_task = tokio::spawn(async move {
-        while let Some((downloaded, total)) = rx.recv().await {
-            let progress = total.map(|t| {
-                if t > 0 {
-                    (downloaded as f64 / t as f64 * 100.0).min(100.0)
-                } else {
-                    0.0
-                }
-            });
-            broadcast(
-                &state_for_progress,
-                "local-llm.download",
-                serde_json::json!({
-                    "modelId": model_id_for_broadcast,
-                    "displayName": display_name_for_broadcast,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "progress": progress,
-                }),
-                BroadcastOpts::default(),
-            )
-            .await;
-        }
-    });
+    let (progress_tx, broadcast_task) =
+        spawn_download_progress_broadcaster(state, &model_id, &display_name);
 
     // Download based on backend
     let result = match model.backend {
         local_gguf::models::ModelBackend::Gguf => {
             local_gguf::models::ensure_model_with_progress(model, cache_dir, |p| {
-                let _ = tx.send((p.downloaded, p.total));
+                let _ = progress_tx.send(Some((p.downloaded, p.total)));
             })
             .await
         },
         local_gguf::models::ModelBackend::Mlx => {
             local_gguf::models::ensure_mlx_model_with_progress(model, cache_dir, |p| {
-                let _ = tx.send((p.downloaded, p.total));
+                let _ = progress_tx.send(Some((p.downloaded, p.total)));
             })
             .await
         },
     };
 
     // Clean up
-    drop(tx);
+    drop(progress_tx);
     let _ = broadcast_task.await;
 
     match result {
@@ -373,47 +362,20 @@ async fn download_custom_gguf_model(
     )
     .await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
-    let state_for_progress = Arc::clone(state);
-    let model_id_for_broadcast = model_id.to_string();
-    let display_name_for_broadcast = display_name.clone();
-
-    let broadcast_task = tokio::spawn(async move {
-        while let Some((downloaded, total)) = rx.recv().await {
-            let progress = total.map(|t| {
-                if t > 0 {
-                    (downloaded as f64 / t as f64 * 100.0).min(100.0)
-                } else {
-                    0.0
-                }
-            });
-            broadcast(
-                &state_for_progress,
-                "local-llm.download",
-                serde_json::json!({
-                    "modelId": model_id_for_broadcast,
-                    "displayName": display_name_for_broadcast,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "progress": progress,
-                }),
-                BroadcastOpts::default(),
-            )
-            .await;
-        }
-    });
+    let (progress_tx, broadcast_task) =
+        spawn_download_progress_broadcaster(state, model_id, &display_name);
 
     let result = local_gguf::models::ensure_custom_model_with_progress(
         hf_repo,
         hf_filename,
         cache_dir,
         |p| {
-            let _ = tx.send((p.downloaded, p.total));
+            let _ = progress_tx.send(Some((p.downloaded, p.total)));
         },
     )
     .await;
 
-    drop(tx);
+    drop(progress_tx);
     let _ = broadcast_task.await;
 
     match result {
@@ -472,42 +434,15 @@ async fn download_hf_mlx_repo(
     )
     .await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
-    let state_for_progress = Arc::clone(state);
-    let model_id_for_broadcast = model_id.clone();
-    let display_name_for_broadcast = display_name.clone();
-
-    let broadcast_task = tokio::spawn(async move {
-        while let Some((downloaded, total)) = rx.recv().await {
-            let progress = total.map(|t| {
-                if t > 0 {
-                    (downloaded as f64 / t as f64 * 100.0).min(100.0)
-                } else {
-                    0.0
-                }
-            });
-            broadcast(
-                &state_for_progress,
-                "local-llm.download",
-                serde_json::json!({
-                    "modelId": model_id_for_broadcast,
-                    "displayName": display_name_for_broadcast,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "progress": progress,
-                }),
-                BroadcastOpts::default(),
-            )
-            .await;
-        }
-    });
+    let (progress_tx, broadcast_task) =
+        spawn_download_progress_broadcaster(state, &model_id, &display_name);
 
     let result = local_llm::models::ensure_mlx_repo_with_progress(hf_repo, cache_dir, |p| {
-        let _ = tx.send((p.downloaded, p.total));
+        let _ = progress_tx.send(Some((p.downloaded, p.total)));
     })
     .await;
 
-    drop(tx);
+    drop(progress_tx);
     let _ = broadcast_task.await;
 
     match result {
@@ -852,40 +787,6 @@ fn status_from_saved_config(config: Option<&LocalLlmConfig>) -> LocalLlmStatus {
             model_id: model.model_id.clone(),
         })
         .unwrap_or(LocalLlmStatus::Unconfigured)
-}
-
-fn broadcast_download_progress_update(
-    state: &Arc<GatewayState>,
-    model_id: &str,
-    display_name: &str,
-    downloaded: u64,
-    total: Option<u64>,
-) {
-    let state = Arc::clone(state);
-    let model_id = model_id.to_string();
-    let display_name = display_name.to_string();
-    tokio::spawn(async move {
-        let progress = total.map(|t| {
-            if t > 0 {
-                (downloaded as f64 / t as f64 * 100.0).min(100.0)
-            } else {
-                0.0
-            }
-        });
-        broadcast(
-            &state,
-            "local-llm.download",
-            serde_json::json!({
-                "modelId": model_id,
-                "displayName": display_name,
-                "downloaded": downloaded,
-                "total": total,
-                "progress": progress,
-            }),
-            BroadcastOpts::default(),
-        )
-        .await;
-    });
 }
 
 fn build_local_provider_entry(
@@ -1453,24 +1354,25 @@ impl LocalLlmService for LiveLocalLlmService {
                 };
                 return;
             };
+            let (progress_tx, progress_task) = spawn_download_progress_broadcaster(
+                state_for_download,
+                &model_id_clone,
+                &display_name_for_task,
+            );
 
             let result = if backend_for_download == "MLX" {
                 local_llm::models::ensure_mlx_repo_with_progress(
                     &hf_repo_for_download,
                     &cache_dir,
                     |p| {
-                        broadcast_download_progress_update(
-                            state_for_download,
-                            &model_id_clone,
-                            &display_name_for_task,
-                            p.downloaded,
-                            p.total,
-                        );
+                        let _ = progress_tx.send(Some((p.downloaded, p.total)));
                     },
                 )
                 .await
             } else {
                 let Some(filename) = hf_filename_for_download.as_deref() else {
+                    drop(progress_tx);
+                    let _ = progress_task.await;
                     let mut s = status.write().await;
                     *s = LocalLlmStatus::Error {
                         model_id: model_id_clone.clone(),
@@ -1483,17 +1385,13 @@ impl LocalLlmService for LiveLocalLlmService {
                     filename,
                     &cache_dir,
                     |p| {
-                        broadcast_download_progress_update(
-                            state_for_download,
-                            &model_id_clone,
-                            &display_name_for_task,
-                            p.downloaded,
-                            p.total,
-                        );
+                        let _ = progress_tx.send(Some((p.downloaded, p.total)));
                     },
                 )
                 .await
             };
+            drop(progress_tx);
+            let _ = progress_task.await;
 
             match result {
                 Ok(_) => {
@@ -2165,6 +2063,14 @@ mod tests {
         let query2 = "qwen2.5-coder";
         let encoded2 = urlencoding::encode(query2);
         assert_eq!(encoded2, "qwen2.5-coder");
+    }
+
+    #[test]
+    fn test_download_progress_percent_bounds_values() {
+        assert_eq!(download_progress_percent(50, Some(100)), Some(50.0));
+        assert_eq!(download_progress_percent(250, Some(100)), Some(100.0));
+        assert_eq!(download_progress_percent(10, Some(0)), Some(0.0));
+        assert_eq!(download_progress_percent(10, None), None);
     }
 
     #[tokio::test]

@@ -402,6 +402,10 @@ fn validate_hf_repo_path(hf_repo: &str) -> anyhow::Result<Vec<&str>> {
         bail!("Hugging Face repo cannot be empty");
     }
 
+    if hf_repo.contains('\\') {
+        bail!("Hugging Face repo must use '/' path separators");
+    }
+
     let parts: Vec<&str> = hf_repo.split('/').collect();
     if parts.is_empty() {
         bail!("Hugging Face repo cannot be empty");
@@ -1125,6 +1129,19 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_model_path_rejects_backslash_repo_separators() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+
+        let result = custom_model_path(
+            r"foo\..\..\AppData\Roaming/model",
+            "Qwen3-4B-Q4_K_M.gguf",
+            cache_dir,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_custom_model_path_distinguishes_repo_collisions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_dir = temp_dir.path();
@@ -1159,6 +1176,14 @@ mod tests {
             url,
             "https://huggingface.co/some%20org/model%20name/resolve/main/quant%20file.gguf"
         );
+    }
+
+    #[test]
+    fn test_custom_model_download_url_rejects_backslash_repo_separators() {
+        let result =
+            custom_model_download_url(r"foo\..\..\AppData\Roaming/model", "quant file.gguf");
+
+        assert!(result.is_err());
     }
 
     #[test]
