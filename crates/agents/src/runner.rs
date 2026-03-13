@@ -49,6 +49,7 @@ fn sanitize_tool_name(name: &str) -> &str {
 
 const MALFORMED_TOOL_RETRY_PROMPT: &str = "Your tool call was malformed. Retry with exact format:\n\
      ```tool_call\n{\"tool\": \"name\", \"arguments\": {...}}\n```";
+const EMPTY_TOOL_NAME_RETRY_PROMPT: &str = "Your structured tool call had an empty tool name. Retry the same tool call using the intended tool's exact name and the same arguments.";
 
 fn find_empty_tool_name_call(tool_calls: &[ToolCall]) -> Option<&ToolCall> {
     tool_calls
@@ -665,6 +666,7 @@ pub async fn run_agent_loop_with_context(
     let mut rate_limit_backoff_ms: Option<u64> = None;
     let mut last_answer_text = String::new();
     let mut malformed_retry_count: u8 = 0;
+    let mut empty_tool_name_retry_count: u8 = 0;
 
     loop {
         iterations += 1;
@@ -847,13 +849,13 @@ pub async fn run_agent_loop_with_context(
         }
 
         if let Some(tc) = find_empty_tool_name_call(&response.tool_calls) {
-            if malformed_retry_count == 0 {
-                malformed_retry_count += 1;
+            if empty_tool_name_retry_count == 0 {
+                empty_tool_name_retry_count += 1;
                 info!(tool_call_id = %tc.id, "detected structured tool call with empty name, requesting retry");
                 messages.push(ChatMessage::assistant(
                     response.text.as_deref().unwrap_or(""),
                 ));
-                messages.push(ChatMessage::user(MALFORMED_TOOL_RETRY_PROMPT));
+                messages.push(ChatMessage::user(EMPTY_TOOL_NAME_RETRY_PROMPT));
                 continue;
             }
             return Err(AgentRunError::Other(anyhow::anyhow!(
@@ -1213,6 +1215,7 @@ pub async fn run_agent_loop_streaming(
     // this is used as the final response text instead of returning silent.
     let mut last_answer_text = String::new();
     let mut malformed_retry_count: u8 = 0;
+    let mut empty_tool_name_retry_count: u8 = 0;
 
     loop {
         iterations += 1;
@@ -1510,11 +1513,11 @@ pub async fn run_agent_loop_streaming(
         }
 
         if let Some(tc) = find_empty_tool_name_call(&tool_calls) {
-            if malformed_retry_count == 0 {
-                malformed_retry_count += 1;
+            if empty_tool_name_retry_count == 0 {
+                empty_tool_name_retry_count += 1;
                 info!(tool_call_id = %tc.id, "detected structured tool call with empty name in stream, requesting retry");
                 messages.push(ChatMessage::assistant(&accumulated_text));
-                messages.push(ChatMessage::user(MALFORMED_TOOL_RETRY_PROMPT));
+                messages.push(ChatMessage::user(EMPTY_TOOL_NAME_RETRY_PROMPT));
                 continue;
             }
             return Err(AgentRunError::Other(anyhow::anyhow!(
@@ -2209,6 +2212,19 @@ mod tests {
         assert_eq!(result.tool_calls_made, 1);
     }
 
+    fn last_user_text(messages: &[ChatMessage]) -> &str {
+        messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ChatMessage::User {
+                    content: UserContent::Text(text),
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("")
+    }
+
     struct EmptyToolNameProvider {
         call_count: std::sync::atomic::AtomicUsize,
     }
@@ -2250,19 +2266,14 @@ mod tests {
                     },
                 }),
                 1 => {
-                    let retry_prompt = messages
-                        .iter()
-                        .rev()
-                        .find_map(|m| match m {
-                            ChatMessage::User {
-                                content: UserContent::Text(text),
-                            } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .unwrap_or("");
+                    let retry_prompt = last_user_text(messages);
                     assert!(
-                        retry_prompt.contains("Retry with exact format"),
+                        retry_prompt.contains("empty tool name"),
                         "runner should ask for a retry, got: {retry_prompt}"
+                    );
+                    assert!(
+                        !retry_prompt.contains("```tool_call"),
+                        "structured retry should not ask for text tool-call fences: {retry_prompt}"
                     );
                     Ok(CompletionResponse {
                         text: None,
@@ -2356,6 +2367,150 @@ mod tests {
         assert_eq!(tool_starts, vec!["echo_tool".to_string()]);
     }
 
+    struct MalformedThenEmptyToolNameProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MalformedThenEmptyToolNameProvider {
+        fn name(&self) -> &str {
+            "mock-malformed-then-empty-tool-name"
+        }
+
+        fn id(&self) -> &str {
+            "mock-malformed-then-empty-tool-name"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match count {
+                0 => Ok(CompletionResponse {
+                    text: Some("```tool_call\n{\"tool\":".into()),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                }),
+                1 => {
+                    let retry_prompt = last_user_text(messages);
+                    assert!(
+                        retry_prompt.contains("Retry with exact format"),
+                        "runner should use malformed tool retry prompt first, got: {retry_prompt}"
+                    );
+                    assert!(
+                        retry_prompt.contains("```tool_call"),
+                        "malformed retry should keep the text fallback format, got: {retry_prompt}"
+                    );
+                    Ok(CompletionResponse {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call_empty_after_text_retry".into(),
+                            name: " ".into(),
+                            arguments: serde_json::json!({"text": "hello"}),
+                        }],
+                        usage: Usage {
+                            input_tokens: 9,
+                            output_tokens: 4,
+                            ..Default::default()
+                        },
+                    })
+                },
+                2 => {
+                    let retry_prompt = last_user_text(messages);
+                    assert!(
+                        retry_prompt.contains("empty tool name"),
+                        "runner should grant a dedicated empty-name retry, got: {retry_prompt}"
+                    );
+                    assert!(
+                        !retry_prompt.contains("```tool_call"),
+                        "empty-name retry should stay on structured tool calls, got: {retry_prompt}"
+                    );
+                    Ok(CompletionResponse {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call_echo_after_dual_retry".into(),
+                            name: "echo_tool".into(),
+                            arguments: serde_json::json!({"text": "hello"}),
+                        }],
+                        usage: Usage {
+                            input_tokens: 8,
+                            output_tokens: 4,
+                            ..Default::default()
+                        },
+                    })
+                },
+                _ => {
+                    let tool_content = messages
+                        .iter()
+                        .find_map(|m| match m {
+                            ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    assert!(
+                        tool_content.contains("\"text\":\"hello\""),
+                        "tool result should include echoed payload, got: {tool_content}"
+                    );
+                    Ok(CompletionResponse {
+                        text: Some("Done after two retries".into()),
+                        tool_calls: vec![],
+                        usage: Usage {
+                            input_tokens: 6,
+                            output_tokens: 3,
+                            ..Default::default()
+                        },
+                    })
+                },
+            }
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_tool_name_retry_does_not_consume_malformed_retry_budget_non_streaming() {
+        let provider = Arc::new(MalformedThenEmptyToolNameProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Use the tool"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Done after two retries");
+        assert_eq!(result.iterations, 4, "two retries + tool call + final text");
+        assert_eq!(
+            result.tool_calls_made, 1,
+            "only the valid tool call should execute"
+        );
+    }
+
     struct EmptyToolNameStreamProvider {
         call_count: std::sync::atomic::AtomicUsize,
     }
@@ -2420,19 +2575,14 @@ mod tests {
                     }),
                 ])),
                 1 => {
-                    let retry_prompt = messages
-                        .iter()
-                        .rev()
-                        .find_map(|m| match m {
-                            ChatMessage::User {
-                                content: UserContent::Text(text),
-                            } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .unwrap_or("");
+                    let retry_prompt = last_user_text(&messages);
                     assert!(
-                        retry_prompt.contains("Retry with exact format"),
+                        retry_prompt.contains("empty tool name"),
                         "runner should ask for a retry, got: {retry_prompt}"
+                    );
+                    assert!(
+                        !retry_prompt.contains("```tool_call"),
+                        "structured retry should not ask for text tool-call fences: {retry_prompt}"
                     );
                     Box::pin(tokio_stream::iter(vec![
                         StreamEvent::ToolCallStart {
@@ -2522,6 +2672,170 @@ mod tests {
             })
             .collect();
         assert_eq!(tool_starts, vec!["echo_tool".to_string()]);
+    }
+
+    struct MalformedThenEmptyToolNameStreamProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MalformedThenEmptyToolNameStreamProvider {
+        fn name(&self) -> &str {
+            "mock-malformed-then-empty-tool-name-stream"
+        }
+
+        fn id(&self) -> &str {
+            "mock-malformed-then-empty-tool-name-stream"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: Some("fallback".into()),
+                tool_calls: vec![],
+                usage: Usage::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            self.stream_with_tools(messages, vec![])
+        }
+
+        fn stream_with_tools(
+            &self,
+            messages: Vec<ChatMessage>,
+            _tools: Vec<serde_json::Value>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match count {
+                0 => Box::pin(tokio_stream::iter(vec![
+                    StreamEvent::Delta("```tool_call\n{\"tool\":".into()),
+                    StreamEvent::Done(Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    }),
+                ])),
+                1 => {
+                    let retry_prompt = last_user_text(&messages);
+                    assert!(
+                        retry_prompt.contains("Retry with exact format"),
+                        "runner should use malformed tool retry prompt first, got: {retry_prompt}"
+                    );
+                    assert!(
+                        retry_prompt.contains("```tool_call"),
+                        "malformed retry should keep the text fallback format, got: {retry_prompt}"
+                    );
+                    Box::pin(tokio_stream::iter(vec![
+                        StreamEvent::ToolCallStart {
+                            id: "call_empty_after_text_retry".into(),
+                            name: " ".into(),
+                            index: 0,
+                        },
+                        StreamEvent::ToolCallArgumentsDelta {
+                            index: 0,
+                            delta: r#"{"text":"hello"}"#.into(),
+                        },
+                        StreamEvent::ToolCallComplete { index: 0 },
+                        StreamEvent::Done(Usage {
+                            input_tokens: 9,
+                            output_tokens: 4,
+                            ..Default::default()
+                        }),
+                    ]))
+                },
+                2 => {
+                    let retry_prompt = last_user_text(&messages);
+                    assert!(
+                        retry_prompt.contains("empty tool name"),
+                        "runner should grant a dedicated empty-name retry, got: {retry_prompt}"
+                    );
+                    assert!(
+                        !retry_prompt.contains("```tool_call"),
+                        "empty-name retry should stay on structured tool calls, got: {retry_prompt}"
+                    );
+                    Box::pin(tokio_stream::iter(vec![
+                        StreamEvent::ToolCallStart {
+                            id: "call_echo_after_dual_retry".into(),
+                            name: "echo_tool".into(),
+                            index: 0,
+                        },
+                        StreamEvent::ToolCallArgumentsDelta {
+                            index: 0,
+                            delta: r#"{"text":"hello"}"#.into(),
+                        },
+                        StreamEvent::ToolCallComplete { index: 0 },
+                        StreamEvent::Done(Usage {
+                            input_tokens: 8,
+                            output_tokens: 4,
+                            ..Default::default()
+                        }),
+                    ]))
+                },
+                _ => {
+                    let tool_content = messages
+                        .iter()
+                        .find_map(|m| match m {
+                            ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("");
+                    assert!(
+                        tool_content.contains("\"text\":\"hello\""),
+                        "tool result should include echoed payload, got: {tool_content}"
+                    );
+                    Box::pin(tokio_stream::iter(vec![
+                        StreamEvent::Delta("Done after two retries".into()),
+                        StreamEvent::Done(Usage {
+                            input_tokens: 6,
+                            output_tokens: 3,
+                            ..Default::default()
+                        }),
+                    ]))
+                },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_tool_name_retry_does_not_consume_malformed_retry_budget_streaming() {
+        let provider = Arc::new(MalformedThenEmptyToolNameStreamProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let result = run_agent_loop_streaming(
+            provider,
+            &tools,
+            "You are a test bot.",
+            &UserContent::text("Use the tool"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Done after two retries");
+        assert_eq!(result.iterations, 4, "two retries + tool call + final text");
+        assert_eq!(
+            result.tool_calls_made, 1,
+            "only the valid tool call should execute"
+        );
     }
 
     /// Mock provider that calls the "exec" tool (native) and verifies result fed back.
