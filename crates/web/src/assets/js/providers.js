@@ -1845,6 +1845,7 @@ function createModelCard(model, provider, totalRamGb) {
 
 export function showModelDownloadProgress(model, provider) {
 	var m = els();
+	m.modal.classList.remove("hidden");
 	m.body.textContent = "";
 
 	var wrapper = document.createElement("div");
