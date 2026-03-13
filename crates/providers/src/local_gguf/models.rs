@@ -415,6 +415,9 @@ fn validate_hf_repo_path(hf_repo: &str) -> anyhow::Result<Vec<&str>> {
         if part.is_empty() || *part == "." || *part == ".." {
             bail!("Hugging Face repo contains invalid path component: {part:?}");
         }
+        if part.contains(':') {
+            bail!("Hugging Face repo contains invalid path component: {part:?}");
+        }
     }
 
     Ok(parts)
@@ -1142,6 +1145,16 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_model_path_rejects_windows_drive_prefix_repo_components() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path();
+
+        let result = custom_model_path("C:/Users/Public/model", "Qwen3-4B-Q4_K_M.gguf", cache_dir);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_custom_model_path_distinguishes_repo_collisions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cache_dir = temp_dir.path();
@@ -1182,6 +1195,13 @@ mod tests {
     fn test_custom_model_download_url_rejects_backslash_repo_separators() {
         let result =
             custom_model_download_url(r"foo\..\..\AppData\Roaming/model", "quant file.gguf");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_custom_model_download_url_rejects_windows_drive_prefix_repo_components() {
+        let result = custom_model_download_url("C:/Users/Public/model", "quant file.gguf");
 
         assert!(result.is_err());
     }

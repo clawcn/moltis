@@ -768,17 +768,20 @@ fn remove_conflicting_custom_gguf_entries(
     config: &mut LocalLlmConfig,
     hf_repo: &str,
     hf_filename: &str,
-) {
+) -> Vec<String> {
     let legacy_model_id = legacy_custom_gguf_model_id(hf_repo);
+    let mut removed_model_ids = Vec::new();
     config.models.retain(|entry| {
-        if entry.model_id == legacy_model_id {
-            return false;
+        let should_remove = entry.model_id == legacy_model_id
+            || (entry.backend == "GGUF"
+                && entry.hf_repo.as_deref() == Some(hf_repo)
+                && entry.hf_filename.as_deref() == Some(hf_filename));
+        if should_remove {
+            removed_model_ids.push(entry.model_id.clone());
         }
-
-        !(entry.backend == "GGUF"
-            && entry.hf_repo.as_deref() == Some(hf_repo)
-            && entry.hf_filename.as_deref() == Some(hf_filename))
+        !should_remove
     });
+    removed_model_ids
 }
 
 fn status_from_saved_config(config: Option<&LocalLlmConfig>) -> LocalLlmStatus {
@@ -828,6 +831,12 @@ fn unregister_local_model_from_registry(registry: &mut ProviderRegistry, model_i
 
     for registry_id in local_registry_ids {
         let _ = registry.unregister(&registry_id);
+    }
+}
+
+fn unregister_local_model_ids_from_registry(registry: &mut ProviderRegistry, model_ids: &[String]) {
+    for model_id in model_ids {
+        unregister_local_model_from_registry(registry, model_id);
     }
 }
 
@@ -1329,16 +1338,23 @@ impl LocalLlmService for LiveLocalLlmService {
 
         // Save configuration (add to existing models)
         let mut config = LocalLlmConfig::load().unwrap_or_default();
-        if backend == "GGUF" {
+        let superseded_model_ids = if backend == "GGUF" {
             let filename = hf_filename
                 .as_deref()
                 .ok_or_else(|| "GGUF models require 'hfFilename' parameter".to_string())?;
-            remove_conflicting_custom_gguf_entries(&mut config, &hf_repo, filename);
-        }
+            remove_conflicting_custom_gguf_entries(&mut config, &hf_repo, filename)
+        } else {
+            Vec::new()
+        };
         config.add_model(entry.clone());
         config
             .save()
             .map_err(|e| format!("failed to save config: {e}"))?;
+
+        if !superseded_model_ids.is_empty() {
+            let mut registry = self.registry.write().await;
+            unregister_local_model_ids_from_registry(&mut registry, &superseded_model_ids);
+        }
 
         // Update status
         {
@@ -1358,6 +1374,7 @@ impl LocalLlmService for LiveLocalLlmService {
         let hf_filename_for_download = hf_filename.clone();
         let backend_for_download = backend.clone();
         let display_name_for_task = display_name.clone();
+        let superseded_model_ids_for_download = superseded_model_ids.clone();
 
         tokio::spawn(async move {
             let state = state_cell.get().cloned();
@@ -1440,6 +1457,10 @@ impl LocalLlmService for LiveLocalLlmService {
                     .await;
 
                     let mut reg = registry.write().await;
+                    unregister_local_model_ids_from_registry(
+                        &mut reg,
+                        &superseded_model_ids_for_download,
+                    );
                     if let Err(error) = register_local_model_entry(&mut reg, &entry) {
                         tracing::error!(model = %entry.model_id, %error, "failed to register custom local model");
                     }
@@ -1960,13 +1981,21 @@ mod tests {
             ],
         };
 
-        remove_conflicting_custom_gguf_entries(&mut config, repo, filename);
+        let mut removed_model_ids =
+            remove_conflicting_custom_gguf_entries(&mut config, repo, filename);
+        removed_model_ids.sort_unstable();
 
         assert_eq!(config.models.len(), 1);
         assert_eq!(
             config.models[0].model_id,
             custom_gguf_model_id(repo, "Qwen3-4B-Q6_K.gguf")
         );
+        let mut expected_removed_model_ids = vec![
+            legacy_custom_gguf_model_id(repo),
+            "custom-stale".to_string(),
+        ];
+        expected_removed_model_ids.sort_unstable();
+        assert_eq!(removed_model_ids, expected_removed_model_ids);
     }
 
     #[test]
@@ -2110,6 +2139,76 @@ mod tests {
                 .iter()
                 .any(|model| model.provider == LOCAL_LLM_PROVIDER_NAME)
         );
+    }
+
+    #[test]
+    fn test_unregister_local_model_ids_from_registry_removes_superseded_entries() {
+        let repo = "Qwen/Qwen3-4B-GGUF";
+        let legacy_entry = LocalModelEntry {
+            model_id: legacy_custom_gguf_model_id(repo),
+            model_path: Some(PathBuf::from("/tmp/legacy.gguf")),
+            hf_repo: None,
+            hf_filename: None,
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        let stale_entry = LocalModelEntry {
+            model_id: "custom-stale".into(),
+            model_path: Some(PathBuf::from("/tmp/stale.gguf")),
+            hf_repo: None,
+            hf_filename: None,
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        let active_entry = LocalModelEntry {
+            model_id: custom_gguf_model_id(repo, "Qwen3-4B-Q6_K.gguf"),
+            model_path: Some(PathBuf::from("/tmp/active.gguf")),
+            hf_repo: None,
+            hf_filename: None,
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+
+        let mut registry = ProviderRegistry::empty();
+        for entry in [&legacy_entry, &stale_entry, &active_entry] {
+            let (info, provider) = build_local_provider_entry(entry).unwrap();
+            registry.register(info, provider);
+        }
+
+        let remote_provider = Arc::new(moltis_providers::openai::OpenAiProvider::new(
+            secrecy::Secret::new("test-key".into()),
+            "custom-stale".into(),
+            "https://example.com".into(),
+        ));
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "custom-stale".into(),
+                provider: "openai".into(),
+                display_name: "Remote Stale Alias".into(),
+                created_at: None,
+            },
+            remote_provider,
+        );
+
+        let superseded_model_ids =
+            vec![legacy_entry.model_id.clone(), stale_entry.model_id.clone()];
+        unregister_local_model_ids_from_registry(&mut registry, &superseded_model_ids);
+
+        assert!(!registry.list_models().iter().any(|model| {
+            model.provider == LOCAL_LLM_PROVIDER_NAME
+                && raw_model_id(&model.id) == legacy_entry.model_id.as_str()
+        }));
+        assert!(!registry.list_models().iter().any(|model| {
+            model.provider == LOCAL_LLM_PROVIDER_NAME
+                && raw_model_id(&model.id) == stale_entry.model_id.as_str()
+        }));
+        assert!(registry.list_models().iter().any(|model| {
+            model.provider == "openai" && raw_model_id(&model.id) == stale_entry.model_id.as_str()
+        }));
+        assert!(registry.list_models().iter().any(|model| {
+            model.provider == LOCAL_LLM_PROVIDER_NAME
+                && raw_model_id(&model.id) == active_entry.model_id.as_str()
+        }));
     }
 
     #[test]
