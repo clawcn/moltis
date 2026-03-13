@@ -1394,6 +1394,13 @@ pub(crate) struct BannerMeta {
     pub tailscale_reset_on_exit: bool,
 }
 
+fn restore_saved_local_llm_models(registry: &mut ProviderRegistry) {
+    #[cfg(feature = "local-llm")]
+    {
+        crate::local_llm_setup::register_saved_local_models(registry);
+    }
+}
+
 /// Prepare the full gateway: load config, run migrations, wire services,
 /// spawn background tasks, and return the composed axum application.
 ///
@@ -1511,10 +1518,9 @@ pub async fn prepare_gateway(
             &config_env_overrides,
         ),
     ));
-    #[cfg(feature = "local-llm")]
     {
         let mut reg = registry.write().await;
-        crate::local_llm_setup::register_saved_local_models(&mut reg);
+        restore_saved_local_llm_models(&mut reg);
     }
     let (provider_summary, providers_available_at_startup) = {
         let reg = registry.read().await;
@@ -3461,7 +3467,7 @@ pub async fn prepare_gateway(
             };
 
             let prefetched_models: usize = prefetched.values().map(Vec::len).sum();
-            let new_registry = match tokio::task::spawn_blocking(move || {
+            let mut new_registry = match tokio::task::spawn_blocking(move || {
                 ProviderRegistry::from_config_with_prefetched(
                     &provider_config_for_startup_discovery,
                     &env_overrides_for_startup_discovery,
@@ -3480,6 +3486,7 @@ pub async fn prepare_gateway(
                 },
             };
 
+            restore_saved_local_llm_models(&mut new_registry);
             let provider_summary = new_registry.provider_summary();
             let model_count = new_registry.list_models().len();
             {
@@ -6317,8 +6324,37 @@ pub(crate) async fn discover_and_build_hooks(
 mod tests {
     use {
         super::*,
-        std::collections::{HashMap, HashSet},
+        moltis_providers::raw_model_id,
+        secrecy::Secret,
+        std::{
+            collections::{HashMap, HashSet},
+            sync::{Mutex, OnceLock},
+        },
     };
+
+    fn local_model_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct LocalModelConfigTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl LocalModelConfigTestGuard {
+        fn new() -> Self {
+            Self {
+                _lock: local_model_config_test_lock(),
+            }
+        }
+    }
+
+    impl Drop for LocalModelConfigTestGuard {
+        fn drop(&mut self) {
+            moltis_config::clear_config_dir();
+            moltis_config::clear_data_dir();
+        }
+    }
 
     #[test]
     fn summarize_model_ids_for_logs_returns_all_when_within_limit() {
@@ -6369,6 +6405,61 @@ mod tests {
         let manager = approval_manager_from_config(&cfg);
         assert_eq!(manager.mode, ApprovalMode::OnMiss);
         assert_eq!(manager.security_level, SecurityLevel::Allowlist);
+    }
+
+    #[cfg(feature = "local-llm")]
+    #[test]
+    fn restore_saved_local_llm_models_rehydrates_custom_models_after_registry_rebuild() {
+        let _guard = LocalModelConfigTestGuard::new();
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+
+        let saved_entry = crate::local_llm_setup::LocalModelEntry {
+            model_id: "custom-qwen".into(),
+            model_path: Some(PathBuf::from("/tmp/custom-qwen.gguf")),
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        crate::local_llm_setup::LocalLlmConfig {
+            models: vec![saved_entry.clone()],
+        }
+        .save()
+        .unwrap();
+
+        let mut rebuilt_registry = ProviderRegistry::empty();
+        let remote_provider = Arc::new(moltis_providers::openai::OpenAiProvider::new(
+            Secret::new("test-key".into()),
+            "remote-model".into(),
+            "https://example.com".into(),
+        ));
+        rebuilt_registry.register(
+            moltis_providers::ModelInfo {
+                id: "remote-model".into(),
+                provider: "openai".into(),
+                display_name: "Remote Model".into(),
+                created_at: None,
+            },
+            remote_provider,
+        );
+
+        restore_saved_local_llm_models(&mut rebuilt_registry);
+
+        assert!(
+            rebuilt_registry
+                .list_models()
+                .iter()
+                .any(|model| model.provider == "openai")
+        );
+        assert!(
+            rebuilt_registry
+                .list_models()
+                .iter()
+                .any(|model| raw_model_id(&model.id) == saved_entry.model_id)
+        );
     }
 
     #[tokio::test]
