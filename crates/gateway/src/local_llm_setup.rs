@@ -43,6 +43,7 @@ impl LocalModelCacheError {
 pub type LocalModelCacheResult<T> = Result<T, LocalModelCacheError>;
 
 type DownloadProgressUpdate = (u64, Option<u64>);
+const LOCAL_LLM_PROVIDER_NAME: &str = "local-llm";
 
 fn download_progress_percent(downloaded: u64, total: Option<u64>) -> Option<f64> {
     total.map(|total_bytes| {
@@ -808,11 +809,26 @@ fn build_local_provider_entry(
     let provider = Arc::new(local_llm::LocalLlmProvider::new(llm_config));
     let info = moltis_providers::ModelInfo {
         id: entry.model_id.clone(),
-        provider: "local-llm".into(),
+        provider: LOCAL_LLM_PROVIDER_NAME.into(),
         display_name: entry.display_name(),
         created_at: None,
     };
     Ok((info, provider))
+}
+
+fn unregister_local_model_from_registry(registry: &mut ProviderRegistry, model_id: &str) {
+    let local_registry_ids: Vec<String> = registry
+        .list_models()
+        .iter()
+        .filter(|model| {
+            model.provider == LOCAL_LLM_PROVIDER_NAME && raw_model_id(&model.id) == model_id
+        })
+        .map(|model| model.id.clone())
+        .collect();
+
+    for registry_id in local_registry_ids {
+        let _ = registry.unregister(&registry_id);
+    }
 }
 
 fn register_local_model_entry(
@@ -820,7 +836,7 @@ fn register_local_model_entry(
     entry: &LocalModelEntry,
 ) -> anyhow::Result<()> {
     let (info, provider) = build_local_provider_entry(entry)?;
-    let _ = registry.unregister(&entry.model_id);
+    unregister_local_model_from_registry(registry, &entry.model_id);
     registry.register(info, provider);
     Ok(())
 }
@@ -1488,7 +1504,7 @@ impl LocalLlmService for LiveLocalLlmService {
         // Remove from provider registry
         {
             let mut reg = self.registry.write().await;
-            reg.unregister(model_id);
+            unregister_local_model_from_registry(&mut reg, local_model_id);
         }
 
         let removed_current_model = {
@@ -2051,6 +2067,49 @@ mod tests {
             .unwrap();
         assert_eq!(registered.provider, "local-llm");
         assert_eq!(registered.display_name, "Qwen3-4B-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_register_local_model_entry_keeps_non_local_collisions() {
+        let mut registry = ProviderRegistry::empty();
+        let remote_provider = Arc::new(moltis_providers::openai::OpenAiProvider::new(
+            secrecy::Secret::new("test-key".into()),
+            "shared-model".into(),
+            "https://example.com".into(),
+        ));
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "shared-model".into(),
+                provider: "openai".into(),
+                display_name: "Shared Remote Model".into(),
+                created_at: None,
+            },
+            remote_provider,
+        );
+
+        let entry = LocalModelEntry {
+            model_id: "shared-model".into(),
+            model_path: Some(PathBuf::from("/tmp/shared-model.gguf")),
+            hf_repo: None,
+            hf_filename: None,
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+
+        register_local_model_entry(&mut registry, &entry).unwrap();
+
+        let registered: Vec<_> = registry
+            .list_models()
+            .iter()
+            .filter(|model| raw_model_id(&model.id) == "shared-model")
+            .collect();
+        assert_eq!(registered.len(), 2);
+        assert!(registered.iter().any(|model| model.provider == "openai"));
+        assert!(
+            registered
+                .iter()
+                .any(|model| model.provider == LOCAL_LLM_PROVIDER_NAME)
+        );
     }
 
     #[test]
