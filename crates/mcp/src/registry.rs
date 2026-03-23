@@ -66,6 +66,9 @@ pub struct McpServerConfig {
     /// Manual OAuth override (skip discovery/dynamic registration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpOAuthConfig>,
+    /// Custom display name for the server (shown in UI instead of technical ID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -84,6 +87,7 @@ impl Default for McpServerConfig {
             url: None,
             headers: HashMap::new(),
             oauth: None,
+            display_name: None,
         }
     }
 }

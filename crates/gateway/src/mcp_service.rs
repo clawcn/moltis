@@ -210,6 +210,12 @@ fn parse_server_config(
         existing.and_then(|cfg| cfg.oauth.clone())
     };
 
+    let display_name = match params.get("display_name") {
+        Some(v) if v.is_null() => None,
+        Some(v) => v.as_str().map(String::from),
+        None => existing.and_then(|cfg| cfg.display_name.clone()),
+    };
+
     Ok(moltis_mcp::McpServerConfig {
         command,
         args,
@@ -224,6 +230,7 @@ fn parse_server_config(
         },
         headers,
         oauth,
+        display_name,
     })
 }
 
