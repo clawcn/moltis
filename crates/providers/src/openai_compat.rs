@@ -1108,7 +1108,6 @@ pub fn parse_responses_completion(resp: &serde_json::Value) -> CompletionRespons
     }
 }
 
-
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
