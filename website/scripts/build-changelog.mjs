@@ -187,8 +187,8 @@ function buildHtml(contentHtml) {
         ${contentHtml}
     </main>
 
-    <!-- Theme toggle script -->
     <script>
+        // Theme toggle
         const modes = ['system', 'light', 'dark'];
         const icons = { light: 'theme-icon-light', system: 'theme-icon-system', dark: 'theme-icon-dark' };
         let current = localStorage.getItem('theme') || 'system';
@@ -203,6 +203,23 @@ function buildHtml(contentHtml) {
             applyTheme(current);
             updateIcon();
         });
+
+        // Highlight active nav tab
+        document.querySelectorAll('.nav-tab').forEach(function(tab) {
+            if (tab.dataset.page === 'changelog') {
+                tab.className = tab.className.replace('text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800', '');
+                tab.classList.add('bg-orange-500', 'text-white');
+            }
+        });
+
+        // GitHub stars
+        fetch('https://api.github.com/repos/moltis-org/moltis')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                var el = document.getElementById('github-stars');
+                if (el && d.stargazers_count != null) el.textContent = d.stargazers_count;
+            })
+            .catch(function() {});
     </script>
 </body>
 </html>
