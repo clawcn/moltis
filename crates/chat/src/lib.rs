@@ -4387,21 +4387,17 @@ impl ChatService for LiveChatService {
             return Err("compact produced empty summary".into());
         }
 
-        // Replace history with a single assistant message containing the summary.
-        let compacted_msg = PersistedMessage::Assistant {
-            content: format!("[Conversation Summary]\n\n{summary}"),
+        // Replace history with a single user message containing the summary.
+        // Using the user role (not assistant) avoids breaking providers like
+        // llama.cpp that require every assistant message to follow a user message,
+        // and ensures the summary stays in the conversation turn array for
+        // providers using the Responses API (which promotes system messages to
+        // instructions).
+        let compacted_msg = PersistedMessage::User {
+            content: MessageContent::Text(format!("[Conversation Summary]\n\n{summary}")),
             created_at: Some(now_ms()),
-            model: None,
-            provider: None,
-            input_tokens: None,
-            output_tokens: None,
-            duration_ms: None,
-            request_input_tokens: None,
-            request_output_tokens: None,
-            tool_calls: None,
-            reasoning: None,
-            llm_api_response: None,
             audio: None,
+            channel: None,
             seq: None,
             run_id: None,
         };
@@ -6904,20 +6900,16 @@ async fn compact_session(
         return Err(error::Error::message("compact produced empty summary"));
     }
 
-    let compacted_msg = PersistedMessage::Assistant {
-        content: format!("[Conversation Summary]\n\n{summary}"),
+    // Use user role so strict providers (e.g. llama.cpp) don't reject the
+    // history for having an assistant message without a preceding user message.
+    // User role also keeps the summary in the conversation turn array for
+    // providers using the Responses API (system messages get promoted to
+    // instructions and disappear from turns).
+    let compacted_msg = PersistedMessage::User {
+        content: MessageContent::Text(format!("[Conversation Summary]\n\n{summary}")),
         created_at: Some(now_ms()),
-        model: None,
-        provider: None,
-        input_tokens: None,
-        output_tokens: None,
-        duration_ms: None,
-        request_input_tokens: None,
-        request_output_tokens: None,
-        tool_calls: None,
-        reasoning: None,
-        llm_api_response: None,
         audio: None,
+        channel: None,
         seq: None,
         run_id: None,
     };
@@ -10039,9 +10031,13 @@ mod tests {
         .expect("assistant reply should be persisted");
 
         assert_eq!(history.len(), 3);
+        // Compacted summary must be a user message so that strict providers
+        // (e.g. llama.cpp) don't reject the history for having an assistant
+        // message without a preceding user message, and so the summary stays
+        // in the conversation turn array for the Responses API.  See #501.
         assert_eq!(
             history[0].get("role").and_then(Value::as_str),
-            Some("assistant")
+            Some("user")
         );
         assert!(
             history[0]
@@ -10059,6 +10055,69 @@ mod tests {
         assert!(
             main_history.is_empty(),
             "auto-compact should not touch the default web session"
+        );
+    }
+
+    /// Regression test for GitHub issue #501: compaction must produce a user
+    /// message, not an assistant message, so that strict providers (llama.cpp)
+    /// don't reject the history for having an orphan assistant turn, and the
+    /// summary stays in the conversation turn array for the Responses API.
+    #[tokio::test]
+    async fn compact_session_produces_user_role() {
+        use moltis_agents::model::values_to_chat_messages;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+
+        let session_key = "test::compact-role";
+
+        // Seed a minimal conversation.
+        store
+            .append(
+                session_key,
+                &serde_json::json!({ "role": "user", "content": "Hello" }),
+            )
+            .await
+            .expect("seed user msg");
+        store
+            .append(
+                session_key,
+                &serde_json::json!({ "role": "assistant", "content": "Hi there!" }),
+            )
+            .await
+            .expect("seed assistant msg");
+
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(AutoCompactRegressionProvider { context_window: 100 });
+        compact_session(&store, session_key, &provider)
+            .await
+            .expect("compact_session should succeed");
+
+        let history = store.read(session_key).await.expect("read compacted");
+        assert_eq!(history.len(), 1, "compaction should leave exactly one message");
+
+        // The compacted message must be a user message.
+        assert_eq!(
+            history[0].get("role").and_then(Value::as_str),
+            Some("user"),
+            "compacted summary must use user role, not assistant (issue #501)"
+        );
+        assert!(
+            history[0]
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.starts_with("[Conversation Summary]")),
+        );
+
+        // Verify the compacted history converts to a User ChatMessage.
+        let chat_msgs = values_to_chat_messages(&history);
+        assert!(
+            !chat_msgs.is_empty(),
+            "compacted history should convert to at least one ChatMessage"
+        );
+        assert!(
+            matches!(chat_msgs[0], ChatMessage::User { .. }),
+            "first ChatMessage after compaction must be User (issue #501)"
         );
     }
 
