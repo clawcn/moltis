@@ -24,6 +24,8 @@ function renderInline(raw) {
 	value = value.replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-[0.85em]">$1</code>');
 	value = value.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
 	value = value.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+	// Turn (#123) into PR/issue links
+	value = value.replace(/\(#(\d+)\)/g, '(<a href="https://github.com/moltis-org/moltis/pull/$1" target="_blank" rel="noopener" class="text-orange-600 dark:text-orange-400 hover:underline">#$1</a>)');
 	return value;
 }
 
