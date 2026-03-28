@@ -5,8 +5,8 @@ use {
         payloads::SendMessageSetters,
         prelude::*,
         types::{
-            CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MediaKind, MessageId,
-            MessageKind, ParseMode, ThreadId,
+            CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MediaKind, MessageKind,
+            ParseMode, ThreadId,
         },
     },
     tracing::{debug, info, warn},
@@ -29,18 +29,10 @@ use crate::{
     state::AccountStateMap,
 };
 
-/// Parse a composite `to` address into `(ChatId, Option<ThreadId>)`.
-fn parse_chat_target(to: &str) -> (ChatId, Option<ThreadId>) {
-    if let Some((chat_part, thread_part)) = to.split_once(':') {
-        let chat_id = ChatId(chat_part.parse::<i64>().unwrap_or(0));
-        let thread_id = thread_part
-            .parse::<i32>()
-            .ok()
-            .map(|id| ThreadId(MessageId(id)));
-        (chat_id, thread_id)
-    } else {
-        (ChatId(to.parse::<i64>().unwrap_or(0)), None)
-    }
+/// Parse a composite `to` address, falling back to `ChatId(0)` on invalid input.
+/// Used by UI helpers (keyboards, cards) where propagating errors is impractical.
+fn parse_chat_target_lossy(to: &str) -> (ChatId, Option<ThreadId>) {
+    crate::topic::parse_chat_target(to).unwrap_or((ChatId(0), None))
 }
 
 /// Extract the forum-topic thread ID from a Telegram message, if present.
@@ -1089,7 +1081,7 @@ async fn handle_message(
 /// Parses the text response from `dispatch_command("sessions")` to extract
 /// session labels, then sends an inline keyboard with one button per session.
 async fn send_sessions_keyboard(bot: &Bot, to: &str, sessions_text: &str) {
-    let (chat, thread_id) = parse_chat_target(to);
+    let (chat, thread_id) = parse_chat_target_lossy(to);
 
     // Parse numbered lines like "1. Session label (5 msgs) *"
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
@@ -1137,7 +1129,7 @@ async fn send_sessions_keyboard(bot: &Bot, to: &str, sessions_text: &str) {
 /// Parses numbered lines like:
 /// `1. 🤖 Main [main] (default) *`
 async fn send_agent_keyboard(bot: &Bot, to: &str, agents_text: &str) {
-    let (chat, thread_id) = parse_chat_target(to);
+    let (chat, thread_id) = parse_chat_target_lossy(to);
     let mut buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     for line in agents_text.lines() {
         let trimmed = line.trim();
@@ -1182,7 +1174,7 @@ async fn send_agent_keyboard(bot: &Bot, to: &str, agents_text: &str) {
 /// Parses the markdown context response from `dispatch_command("context")`
 /// and renders it as a structured Telegram HTML message.
 async fn send_context_card(bot: &Bot, to: &str, context_text: &str) {
-    let (chat, thread_id) = parse_chat_target(to);
+    let (chat, thread_id) = parse_chat_target_lossy(to);
 
     // Parse "**Key:** value" lines from the markdown response into a map.
     let mut fields: Vec<(&str, String)> = Vec::new();
@@ -1263,7 +1255,7 @@ Tokens    {tokens}</code>"
 /// If the response starts with `providers:`, show a provider picker first.
 /// Otherwise show the model list directly.
 async fn send_model_keyboard(bot: &Bot, to: &str, text: &str) {
-    let (chat, thread_id) = parse_chat_target(to);
+    let (chat, thread_id) = parse_chat_target_lossy(to);
 
     let is_provider_list = text.starts_with("providers:");
 
@@ -1329,7 +1321,7 @@ async fn send_model_keyboard(bot: &Bot, to: &str, text: &str) {
 /// First line is `status:on` or `status:off`. Remaining lines are numbered
 /// images, with `*` marking the current one.
 async fn send_sandbox_keyboard(bot: &Bot, to: &str, text: &str) {
-    let (chat, thread_id) = parse_chat_target(to);
+    let (chat, thread_id) = parse_chat_target_lossy(to);
 
     let mut is_on = false;
     let mut image_buttons: Vec<Vec<InlineKeyboardButton>> = Vec::new();

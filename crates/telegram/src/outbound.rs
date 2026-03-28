@@ -5,8 +5,8 @@ use {
     teloxide::{
         ApiError, RequestError,
         payloads::{
-            SendAudioSetters, SendDocumentSetters, SendLocationSetters, SendMessageSetters,
-            SendPhotoSetters, SendVenueSetters, SendVoiceSetters,
+            SendAudioSetters, SendChatActionSetters, SendDocumentSetters, SendLocationSetters,
+            SendMessageSetters, SendPhotoSetters, SendVenueSetters, SendVoiceSetters,
         },
         prelude::*,
         types::{ChatAction, ChatId, InputFile, MessageId, ParseMode, ReplyParameters, ThreadId},
@@ -28,22 +28,7 @@ use crate::{
     state::AccountStateMap,
 };
 
-/// Parse a composite `to` address into `(ChatId, Option<ThreadId>)`.
-///
-/// Forum-topic sends encode the thread as `"chat_id:thread_id"`.
-/// Plain sends are just `"chat_id"`.
-fn parse_chat_target(to: &str) -> Result<(ChatId, Option<ThreadId>)> {
-    if let Some((chat_part, thread_part)) = to.split_once(':') {
-        let chat_id = ChatId(chat_part.parse::<i64>()?);
-        let thread_id = thread_part
-            .parse::<i32>()
-            .ok()
-            .map(|id| ThreadId(MessageId(id)));
-        Ok((chat_id, thread_id))
-    } else {
-        Ok((ChatId(to.parse::<i64>()?), None))
-    }
-}
+use crate::topic::parse_chat_target;
 
 /// Outbound message sender for Telegram.
 pub struct TelegramOutbound {
@@ -638,8 +623,12 @@ impl ChannelOutbound for TelegramOutbound {
 
     async fn send_typing(&self, account_id: &str, to: &str) -> Result<()> {
         let bot = self.get_bot(account_id)?;
-        let (chat_id, _thread_id) = parse_chat_target(to)?;
-        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+        let (chat_id, thread_id) = parse_chat_target(to)?;
+        let mut req = bot.send_chat_action(chat_id, ChatAction::Typing);
+        if let Some(tid) = thread_id {
+            req = req.message_thread_id(tid);
+        }
+        let _ = req.await;
         Ok(())
     }
 
