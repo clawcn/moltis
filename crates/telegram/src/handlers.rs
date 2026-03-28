@@ -1651,17 +1651,20 @@ fn extract_text_document_content(data: &[u8], media_type: &str) -> Option<String
 
     let mut truncated = false;
 
-    // Byte-limit: find the largest valid UTF-8 prefix within the cap.
+    // Byte-limit: truncate to the last valid UTF-8 boundary within the cap
+    // so we never inject U+FFFD from slicing a multi-byte sequence.
     let bounded = if data.len() > MAX_INLINE_DOCUMENT_BYTES {
         truncated = true;
-        &data[..MAX_INLINE_DOCUMENT_BYTES]
+        let slice = &data[..MAX_INLINE_DOCUMENT_BYTES];
+        match std::str::from_utf8(slice) {
+            Ok(_) => slice,
+            Err(e) => &slice[..e.valid_up_to()],
+        }
     } else {
         data
     };
 
-    // Convert to a string, lossy-replacing any invalid bytes. This handles
-    // both the truncated case (where we may have cut a multi-byte sequence)
-    // and files with stray non-UTF-8 bytes.
+    // Lossy-convert for files with stray invalid bytes in the middle.
     let lossy = String::from_utf8_lossy(bounded);
     let trimmed = lossy.trim();
     if trimmed.is_empty() {
@@ -2293,6 +2296,24 @@ mod tests {
             .expect("should produce text");
         // Should not end with the replacement character
         assert!(!result.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn extract_text_document_content_cjk_no_replacement_char() {
+        // CJK chars are 3 bytes each. Build a buffer that exceeds the byte
+        // limit but stays under the char limit (~21K chars < 24K cap), so the
+        // char-limit branch is NOT taken. U+FFFD must still not appear.
+        // U+4E00 (一) = [0xE4, 0xB8, 0x80]
+        let cjk = [0xE4u8, 0xB8, 0x80];
+        let char_count = (MAX_INLINE_DOCUMENT_BYTES + 2) / 3; // enough to exceed byte cap
+        assert!(char_count < MAX_INLINE_DOCUMENT_CHARS, "test requires char count below cap");
+        let data: Vec<u8> = cjk.iter().copied().cycle().take(char_count * 3).collect();
+        assert!(data.len() > MAX_INLINE_DOCUMENT_BYTES);
+
+        let result = extract_text_document_content(&data, "text/plain")
+            .expect("should produce text");
+        assert!(!result.contains('\u{FFFD}'), "U+FFFD found in CJK truncation result");
+        assert!(result.contains("[Document content truncated]"));
     }
 
     #[tokio::test]
